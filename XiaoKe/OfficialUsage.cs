@@ -76,6 +76,7 @@ sealed class ProbeOfficialUsage : IOfficialUsage
         }
         probing = true;
         lastProbe = DateTime.UtcNow;
+        if (Environment.GetEnvironmentVariable("XK_DEBUG") != null) Log.Info("開始讀取官方額度 force=" + force);
         var cwd = ProbeCwd();
         var th = new Thread(() =>
         {
@@ -98,7 +99,7 @@ sealed class ProbeOfficialUsage : IOfficialUsage
             LastError = null;
             Save();
         }
-        else LastError = r.Error;
+        else { LastError = r.Error; Log.Info("官方額度讀取失敗：" + r.Error); }
         onDone(r.Ok);
     }
 
@@ -203,6 +204,8 @@ static class ProbeRunner
         return resetsAt != null ? new QuotaWindow(double.Parse(m.Groups[1].Value), resetsAt.Value) : null;
     }
 
+    [DllImport("kernel32.dll")] static extern bool SetStdHandle(int which, IntPtr handle);
+
     static string Tail(string t)
     {
         t = Regex.Replace(t, @"\s+", " ").Trim();
@@ -231,6 +234,8 @@ static class ProbeRunner
             ? $"cmd.exe /c \"\"{claude}\" --settings \"{{\\\"disableAllHooks\\\":true}}\"\""
             : $"\"{claude}\" --settings \"{{\\\"disableAllHooks\\\":true}}\"";
 
+        // 小克若是被 hook 以 stdio:ignore 啟動，自己的標準輸出入是空的 NUL；子程序會沿用它們而不是偽終端機，claude 就立刻結束。先清掉。
+        SetStdHandle(-10, IntPtr.Zero); SetStdHandle(-11, IntPtr.Zero); SetStdHandle(-12, IntPtr.Zero);
         using var pty = ConPty.Start(cmd, cwd, 120, 40);
         var sw = Stopwatch.StartNew();
         long sentAt = -1;
