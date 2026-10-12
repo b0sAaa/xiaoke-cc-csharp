@@ -1,0 +1,13 @@
+{
+  "name": "xiaoke-cc",
+  "version": "0.1.0",
+  "description": "Claude Code 記賬桌寵「小克」（.NET 8 WPF 版）：讀本地對話記錄估算花費，每週額度量槽，跟著 Claude Code 一起開關",
+  "private": true,
+  "scripts": {
+    "assets": "node scripts/fetch-assets.js",
+    "build": "dotnet publish XiaoKe/XiaoKe.csproj -c Release --no-self-contained -o XiaoKe/publish",
+    "hooks:install": "node scripts/hooks.js install",
+    "hooks:uninstall": "node scripts/hooks.js uninstall"
+  },
+  "license": "MIT"
+}

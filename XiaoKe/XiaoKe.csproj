@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>XiaoKe</AssemblyName>
+    <RootNamespace>XiaoKe</RootNamespace>
+    <Version>0.1.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- WPF 只認 app.manifest 的 PerMonitorV2；WinForms 分析器建議改用 SetHighDpiMode，對 WPF 沒意義，故略過 -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
+
+    <!-- 降低記憶體：不開背景 GC 執行緒、關掉 PGO 插樁。
+         注意不能開 InvariantGlobalization：WPF 的 TextBox 取輸入法語系（如 zh-TW 0x0404）時會丟 CultureNotFoundException -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <TieredPGO>false</TieredPGO>
+    <UseSystemResourceKeys>false</UseSystemResourceKeys>
+  </PropertyGroup>
+
+  <!-- 角色圖與音效在上層 ../assets（被 .gitignore 排除、原作者不授權再分發），建置時複製到輸出目錄 -->
+  <PropertyGroup>
+    <ParentAssetsDir>$(MSBuildProjectDirectory)\..\assets</ParentAssetsDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(ParentAssetsDir)\**\*" Link="assets\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\lines.json" Link="lines.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\pricing.json" Link="pricing.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="CheckParentAssets" BeforeTargets="BeforeBuild">
+    <Warning Condition="!Exists('$(ParentAssetsDir)\xiaoke1.png')"
+             Text="找不到 $(ParentAssetsDir)\xiaoke1.png：請先在上層資料夾執行 npm run assets（下載角色圖與音效），再重新建置。" />
+  </Target>
+
+</Project>

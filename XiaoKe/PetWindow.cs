@@ -1,0 +1,776 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using Forms = System.Windows.Forms;
+
+namespace XiaoKe;
+
+/// <summary>小克本體：無邊框透明置頂視窗，角色圖 + 量槽 + 對話氣泡。</summary>
+sealed class PetWindow : Window
+{
+    public const int W = 300;
+    public const int H = 440;
+
+    readonly PetApp app;
+    Config Cfg => app.Cfg;
+    IntPtr hwnd;
+
+    // 視覺元素
+    readonly Grid root = new();
+    readonly StackPanel stage = new();
+    readonly Image charImg = new();
+    readonly ScaleTransform charScale = new(1, 1);
+    readonly Border badge = new();
+    readonly StackPanel fiveBox = new();
+    readonly TextBlock pct5, pct;
+    readonly Border fill5, fill;
+    readonly Grid bubbleHost = new();
+    readonly Border bubbleBody = new();
+    readonly Border bubbleTail = new();
+    readonly ScaleTransform bubbleScale = new(0.6, 0.6);
+    const double TrackW = 176 - 3 - 18; // 量槽寬 - 邊框 - 左右內距
+
+    // 狀態
+    UsageStats? stats;
+    double curH = H; // 目前視窗高度（DIP）：氣泡太高時往上加高、底部位置不動
+    bool shown;
+    bool ignoring;
+    double wantH = -1;
+    double stageH;
+    Drag? drag;
+    DispatcherTimer? clickTimer, pressTimer;
+    readonly DispatcherTimer hideTimer = new(), fitTimer = new(), hitTimer = new(DispatcherPriority.Background);
+
+    // 角色圖不透明區域（alpha>30，1/4 降取樣）
+    bool[]? mask;
+    int maskW, maskH;
+
+    // 臺詞
+    List<(string Text, double Weight)> lines = new();
+    int lastIdx = -1;
+    static readonly Random Rng = new();
+    static readonly string[] PokeSounds = { "D1.mp3", "D2.mp3", "Ya1.mp3", "Ya2.mp3" };
+
+    sealed class Drag
+    {
+        public Native.POINT C;
+        public int X, Bottom;
+        public bool Moved;
+    }
+
+    public IntPtr Hwnd => hwnd;
+    public double Scale => hwnd == IntPtr.Zero ? 1.0 : Native.GetDpiForWindow(hwnd) / 96.0;
+
+    public PetWindow(PetApp app, string assetsDir)
+    {
+        this.app = app;
+        Title = "小克";
+        WindowStyle = WindowStyle.None;
+        AllowsTransparency = true;
+        Background = Brushes.Transparent;
+        ResizeMode = ResizeMode.NoResize;
+        ShowInTaskbar = false;
+        ShowActivated = false;
+        Topmost = true;
+        Width = W;
+        Height = H;
+        UseLayoutRounding = true;
+        SnapsToDevicePixels = true;
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = -32000; Top = -32000; // 先放到螢幕外，SourceInitialized 再定位，避免閃一下
+
+        // ---- 角色圖 ----
+        var bmp = new BitmapImage();
+        bmp.BeginInit();
+        bmp.UriSource = new Uri(Path.Combine(assetsDir, "xiaoke1.png"));
+        bmp.CacheOption = BitmapCacheOption.OnLoad;
+        bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+        bmp.EndInit();
+        bmp.Freeze();
+        BuildMask(bmp);
+        charImg.Source = bmp;
+        charImg.Stretch = Stretch.Uniform;
+        RenderOptions.SetBitmapScalingMode(charImg, BitmapScalingMode.Fant);
+        charImg.RenderTransformOrigin = new Point(0.5, 1);
+        charImg.RenderTransform = charScale;
+        charImg.Effect = Ui.Shadow(4, 3, 0.25);
+        charImg.Cursor = Cursors.Hand;
+        charImg.MouseLeftButtonDown += CharDown;
+        charImg.MouseMove += CharMove;
+        charImg.MouseLeftButtonUp += (_, e) => EndDrag();
+        charImg.LostMouseCapture += (_, _) => EndDrag();
+
+        // ---- 量槽 ----
+        badge.Width = 176;
+        badge.Padding = new Thickness(9, 5, 9, 7);
+        badge.BorderThickness = new Thickness(1.5);
+        badge.BorderBrush = Ui.BadgeBorder;
+        badge.CornerRadius = new CornerRadius(10);
+        badge.Background = Ui.Sand;
+        badge.Cursor = Cursors.Hand;
+        badge.Margin = new Thickness(0, -16, 0, 0);
+        badge.Effect = Ui.Shadow(6, 2, 0.16);
+        ToolTipService.SetInitialShowDelay(badge, 500);
+        ToolTipService.SetShowDuration(badge, 30000);
+        var badgeStack = new StackPanel();
+        (pct5, fill5) = MakeBar("5-hour", out var fiveRow, out var fiveTrack);
+        fiveBox.Children.Add(fiveRow);
+        fiveBox.Children.Add(fiveTrack);
+        fiveBox.Margin = new Thickness(0, 0, 0, 6);
+        fiveBox.Visibility = Visibility.Collapsed;
+        badgeStack.Children.Add(fiveBox);
+        (pct, fill) = MakeBar("Weekly · all models", out var wRow, out var wTrack);
+        badgeStack.Children.Add(wRow);
+        badgeStack.Children.Add(wTrack);
+        badge.Child = badgeStack;
+        badge.MouseLeftButtonUp += (_, e) => { OnBadgeClick(); e.Handled = true; };
+
+        stage.HorizontalAlignment = HorizontalAlignment.Center;
+        stage.VerticalAlignment = VerticalAlignment.Bottom;
+        stage.Margin = new Thickness(0, 0, 0, 4);
+        stage.Children.Add(charImg);
+        stage.Children.Add(badge);
+
+        // ---- 氣泡 ----
+        bubbleBody.Background = Ui.Sand;
+        bubbleBody.BorderBrush = Ui.Coral;
+        bubbleBody.BorderThickness = new Thickness(3);
+        bubbleBody.CornerRadius = new CornerRadius(16);
+        bubbleBody.Padding = new Thickness(14, 10, 14, 10);
+        bubbleBody.MinWidth = 90;
+        bubbleBody.MaxWidth = 260;
+        bubbleBody.Effect = Ui.Shadow(8, 3, 0.18);
+        bubbleBody.MouseLeftButtonUp += (_, e) =>
+        {
+            if (e.OriginalSource is DependencyObject d && IsInside<TextBox>(d)) return;
+            HideBubble();
+        };
+        bubbleTail.Width = bubbleTail.Height = 19;
+        bubbleTail.Background = Ui.Sand;
+        bubbleTail.BorderBrush = Ui.Coral;
+        bubbleTail.BorderThickness = new Thickness(0, 0, 3, 3);
+        bubbleTail.HorizontalAlignment = HorizontalAlignment.Center;
+        bubbleTail.VerticalAlignment = VerticalAlignment.Bottom;
+        bubbleTail.Margin = new Thickness(0, 0, 0, -8);
+        bubbleTail.RenderTransformOrigin = new Point(0.5, 0.5);
+        bubbleTail.RenderTransform = new RotateTransform(45);
+        bubbleHost.HorizontalAlignment = HorizontalAlignment.Center;
+        bubbleHost.VerticalAlignment = VerticalAlignment.Bottom;
+        bubbleHost.Opacity = 0;
+        bubbleHost.IsHitTestVisible = false;
+        bubbleHost.RenderTransformOrigin = new Point(0.5, 1);
+        bubbleHost.RenderTransform = bubbleScale;
+        bubbleHost.Children.Add(bubbleBody);
+        bubbleHost.Children.Add(bubbleTail);
+
+        root.Children.Add(bubbleHost);
+        root.Children.Add(stage);
+        Content = root;
+
+        MouseRightButtonUp += (_, e) => { app.ShowMenu(); e.Handled = true; };
+
+        hideTimer.Tick += (_, _) => { hideTimer.Stop(); HideBubble(); };
+        fitTimer.Tick += (_, _) => { fitTimer.Stop(); RunFit(); };
+        hitTimer.Interval = TimeSpan.FromMilliseconds(150);
+        hitTimer.Tick += (_, _) => HitTick();
+
+        LoadLines();
+        ApplyScale();
+    }
+
+    // ================= 初始化 / 位置 =================
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        hwnd = new WindowInteropHelper(this).Handle;
+        PlaceInitial();
+        ignoring = false;
+        SetIgnore(true);
+        hitTimer.Start();
+    }
+
+    void PlaceInitial()
+    {
+        double ps = Native.PrimaryScale();
+        int wP = (int)Math.Round(W * ps), hP = (int)Math.Round(H * ps);
+        var wa = Forms.Screen.PrimaryScreen?.WorkingArea ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
+        int x = wa.X + wa.Width - wP - (int)Math.Round(20 * ps);
+        int y = wa.Y + wa.Height - hP;
+        // 存下來的位置如果已經不在任何螢幕內（拔了螢幕、拖到畫面外），就回到右下角
+        if (Cfg.X != null && Cfg.Y != null)
+        {
+            int sx = (int)Math.Round(Cfg.X.Value * ps), sy = (int)Math.Round(Cfg.Y.Value * ps);
+            int cx = sx + wP / 2, cy = sy + hP / 2;
+            if (Forms.Screen.AllScreens.Any(s => cx >= s.WorkingArea.X && cx <= s.WorkingArea.Right && cy >= s.WorkingArea.Y && cy <= s.WorkingArea.Bottom))
+            { x = sx; y = sy; }
+        }
+        Native.SetWindowPos(hwnd, IntPtr.Zero, x, y, wP, hP, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+    }
+
+    protected override void OnContentRendered(EventArgs e)
+    {
+        base.OnContentRendered(e);
+        // 實際所在螢幕的縮放可能和主螢幕不同：以目前縮放重算尺寸，底部與左邊不動
+        if (Native.GetWindowRect(hwnd, out var r)) SetBounds(r.Left, r.Bottom, curH);
+    }
+
+    protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+    {
+        base.OnDpiChanged(oldDpi, newDpi);
+        if (drag == null && Native.GetWindowRect(hwnd, out var r)) SetBounds(r.Left, r.Bottom, curH);
+    }
+
+    void SetBounds(int xPhys, int bottomPhys, double hDip)
+    {
+        double s = Scale;
+        int wP = (int)Math.Round(W * s), hP = (int)Math.Round(hDip * s);
+        Native.SetWindowPos(hwnd, IntPtr.Zero, xPhys, bottomPhys - hP, wP, hP, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+    }
+
+    /// <summary>回到主螢幕工作區右下角。</summary>
+    public void ResetPosition()
+    {
+        double s = Scale;
+        var wa = Forms.Screen.PrimaryScreen?.WorkingArea ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
+        curH = H;
+        wantH = -1;
+        int wP = (int)Math.Round(W * s), hP = (int)Math.Round(H * s);
+        Native.SetWindowPos(hwnd, IntPtr.Zero, wa.X + wa.Width - wP - (int)Math.Round(20 * s), wa.Y + wa.Height - hP, wP, hP, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+        if (shown) ScheduleFit();
+    }
+
+    /// <summary>氣泡太高放不下時，視窗往上加高（need 為需要的總高度 DIP，0 = 還原）。</summary>
+    void Fit(double need)
+    {
+        if (hwnd == IntPtr.Zero || !Native.GetWindowRect(hwnd, out var r)) return;
+        double s = Scale;
+        var wa = Forms.Screen.FromHandle(hwnd).WorkingArea;
+        double target = Math.Min(Math.Max(H, Math.Ceiling(need)), wa.Height / s);
+        if (target == curH) return;
+        curH = target;
+        SetBounds(r.Left, r.Bottom, target);
+    }
+
+    void ScheduleFit()
+    {
+        fitTimer.Stop();
+        fitTimer.Interval = TimeSpan.FromMilliseconds(shown ? 1 : 250);
+        fitTimer.Start();
+    }
+
+    void RunFit()
+    {
+        double need = 0;
+        if (shown)
+        {
+            bubbleBody.Measure(new Size(W, double.PositiveInfinity));
+            need = stageH + bubbleBody.DesiredSize.Height + 30;
+        }
+        if (need != wantH) { wantH = need; Fit(need); }
+        if (!shown) Native.TrimWorkingSet(); // 氣泡收起後順便縮小工作集
+    }
+
+    // ================= 設定 / 尺寸 =================
+    public void OnConfig()
+    {
+        ApplyScale();
+        RenderBadge();
+    }
+
+    void ApplyScale()
+    {
+        double w = Math.Round(170 * Cfg.Scale);
+        var src = charImg.Source as BitmapSource;
+        double aspect = src != null ? (double)src.PixelHeight / src.PixelWidth : 1;
+        charImg.Width = w;
+        charImg.Height = Math.Round(w * aspect);
+        PlaceBubble();
+        if (shown) ScheduleFit();
+    }
+
+    void PlaceBubble()
+    {
+        stage.Measure(new Size(W, double.PositiveInfinity));
+        stageH = stage.DesiredSize.Height;
+        bubbleHost.Margin = new Thickness(0, 0, 0, stageH + 6);
+    }
+
+    // ================= 氣泡 =================
+    public void Say(UIElement content, double seconds = 4)
+    {
+        bubbleBody.Child = content;
+        PlaceBubble();
+        ShowBubble();
+        hideTimer.Stop();
+        if (seconds > 0) { hideTimer.Interval = TimeSpan.FromSeconds(seconds); hideTimer.Start(); }
+    }
+
+    public void SayText(string text, double seconds = 4) =>
+        Say(Ui.Text(text, 14, Ui.Brown), seconds);
+
+    void ShowBubble()
+    {
+        if (!shown)
+        {
+            shown = true;
+            bubbleHost.IsHitTestVisible = true;
+            bubbleHost.BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(150)));
+            var grow = new DoubleAnimation(1, TimeSpan.FromMilliseconds(200)) { EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.5 } };
+            bubbleScale.BeginAnimation(ScaleTransform.ScaleXProperty, grow);
+            bubbleScale.BeginAnimation(ScaleTransform.ScaleYProperty, grow);
+        }
+        ScheduleFit();
+    }
+
+    public void HideBubble()
+    {
+        if (!shown) return;
+        shown = false;
+        bubbleHost.IsHitTestVisible = false;
+        bubbleHost.BeginAnimation(OpacityProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(150)));
+        var shrink = new DoubleAnimation(0.6, TimeSpan.FromMilliseconds(200));
+        bubbleScale.BeginAnimation(ScaleTransform.ScaleXProperty, shrink);
+        bubbleScale.BeginAnimation(ScaleTransform.ScaleYProperty, shrink);
+        ScheduleFit();
+    }
+
+    static bool IsInside<T>(DependencyObject d) where T : DependencyObject
+    {
+        while (d != null)
+        {
+            if (d is T) return true;
+            d = d is Visual or System.Windows.Media.Media3D.Visual3D ? VisualTreeHelper.GetParent(d) : LogicalTreeHelper.GetParent(d);
+        }
+        return false;
+    }
+
+    // ================= 臺詞 / 音效 =================
+    public void LoadLines()
+    {
+        var list = new List<(string, double)>();
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(Paths.LinesFile));
+            foreach (var it in doc.RootElement.EnumerateArray())
+            {
+                var text = it.GetProperty("text").GetString() ?? "";
+                double w = it.TryGetProperty("weight", out var wv) && wv.ValueKind == JsonValueKind.Number ? wv.GetDouble() : 0;
+                list.Add((text, w == 0 ? 1 : w));
+            }
+        }
+        catch { list = new List<(string, double)> { ("臺詞檔案壞掉了...", 1) }; }
+        lines = list;
+        lastIdx = -1;
+    }
+
+    string PickLine()
+    {
+        if (lines.Count == 0) return "...";
+        double total = lines.Sum(l => l.Weight);
+        for (int tries = 0; tries < 5; tries++)
+        {
+            double r = Rng.NextDouble() * total;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                r -= lines[i].Weight;
+                if (r <= 0)
+                {
+                    if (i != lastIdx || lines.Count == 1) { lastIdx = i; return lines[i].Text; }
+                    break;
+                }
+            }
+        }
+        lastIdx = (lastIdx + 1) % lines.Count;
+        return lines[lastIdx].Text;
+    }
+
+    // ================= 互動 =================
+    void Press(int holdMs)
+    {
+        SetCharScale(1.07, 0.88, 60, null);
+        pressTimer?.Stop();
+        pressTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(holdMs) };
+        pressTimer.Tick += (_, _) =>
+        {
+            pressTimer!.Stop();
+            SetCharScale(1, 1, 120, new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 1.2 });
+        };
+        pressTimer.Start();
+    }
+
+    void SetCharScale(double sx, double sy, int ms, IEasingFunction? ease)
+    {
+        charScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(sx, TimeSpan.FromMilliseconds(ms)) { EasingFunction = ease });
+        charScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(sy, TimeSpan.FromMilliseconds(ms)) { EasingFunction = ease });
+    }
+
+    public void Poke()
+    {
+        Press(140);
+        if (Cfg.Sound) app.PlaySound(PokeSounds[Rng.Next(PokeSounds.Length)]);
+        SayText(PickLine(), 4);
+    }
+
+    // 單擊戳一下；雙擊彈出「問 Claude」輸入框（單擊延遲 260 ms，等等看是不是雙擊）
+    void OnClick()
+    {
+        if (clickTimer != null) { clickTimer.Stop(); clickTimer = null; app.OpenQuick(); return; }
+        clickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(260) };
+        clickTimer.Tick += (_, _) => { clickTimer!.Stop(); clickTimer = null; Poke(); };
+        clickTimer.Start();
+    }
+
+    // ---- 拖曳：直接讀滑鼠的真實螢幕座標（實體像素），以視窗底部為基準，不會因 DPI 縮放漂移 ----
+    void CharDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Left) return;
+        if (!Native.GetCursorPos(out var c) || !Native.GetWindowRect(hwnd, out var r)) return;
+        charImg.CaptureMouse();
+        drag = new Drag { C = c, X = r.Left, Bottom = r.Bottom };
+        e.Handled = true;
+    }
+
+    void CharMove(object sender, MouseEventArgs e)
+    {
+        if (drag == null || !Native.GetCursorPos(out var n) || !Native.GetWindowRect(hwnd, out var r)) return;
+        if (!drag.Moved)
+        {
+            if (Math.Sqrt(Math.Pow(n.X - drag.C.X, 2) + Math.Pow(n.Y - drag.C.Y, 2)) / Scale <= 4) return; // 移動超過 4 px 才算拖
+            drag.Moved = true;
+            charImg.Cursor = Cursors.SizeAll;
+        }
+        // 寬高沿用視窗當下的實際尺寸；拖動中氣泡收起造成高度變化，底部仍固定，不會跳
+        Native.SetWindowPos(hwnd, IntPtr.Zero, drag.X + n.X - drag.C.X, drag.Bottom + n.Y - drag.C.Y - r.Height, r.Width, r.Height,
+            Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+    }
+
+    void EndDrag()
+    {
+        if (drag == null) return;
+        var d = drag;
+        drag = null;
+        charImg.Cursor = Cursors.Hand;
+        if (charImg.IsMouseCaptured) charImg.ReleaseMouseCapture();
+        if (d.Moved)
+        {
+            if (Native.GetWindowRect(hwnd, out var r))
+            {
+                double s = Scale;
+                Cfg.X = Math.Round(r.Left / s);
+                Cfg.Y = Math.Round((r.Bottom - Math.Round(H * s)) / s); // 存「未加高時」的視窗頂端
+                Cfg.Save();
+            }
+        }
+        else OnClick();
+    }
+
+    // ================= 透明區域點穿 =================
+    void BuildMask(BitmapSource src)
+    {
+        if (src.Format != PixelFormats.Bgra32) src = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+        int w = src.PixelWidth, h = src.PixelHeight, stride = w * 4;
+        var pix = new byte[stride * h];
+        src.CopyPixels(pix, stride, 0);
+        const int step = 4;
+        maskW = (w + step - 1) / step;
+        maskH = (h + step - 1) / step;
+        mask = new bool[maskW * maskH];
+        for (int y = 0; y < maskH; y++)
+            for (int x = 0; x < maskW; x++)
+                mask[y * maskW + x] = pix[((y * step) * w + x * step) * 4 + 3] > 30;
+    }
+
+    Rect BoundsOf(FrameworkElement el) => el.TransformToVisual(root).TransformBounds(new Rect(0, 0, el.ActualWidth, el.ActualHeight));
+
+    bool OverChar(double x, double y)
+    {
+        var r = BoundsOf(charImg);
+        if (x < r.Left || x >= r.Right || y < r.Top || y >= r.Bottom) return false;
+        if (mask == null) return true;
+        int px = (int)Math.Floor((x - r.Left) / r.Width * maskW);
+        int py = (int)Math.Floor((y - r.Top) / r.Height * maskH);
+        if (px < 0 || py < 0 || px >= maskW || py >= maskH) return false;
+        return mask[py * maskW + px];
+    }
+
+    bool IsSolid(double x, double y)
+    {
+        var p = new Point(x, y);
+        if (BoundsOf(badge).Contains(p)) return true;
+        if (shown && (BoundsOf(bubbleBody).Contains(p) || BoundsOf(bubbleTail).Contains(p))) return true;
+        return OverChar(x, y);
+    }
+
+    void SetIgnore(bool ignore)
+    {
+        if (ignore == ignoring || hwnd == IntPtr.Zero) return;
+        ignoring = ignore;
+        int ex = Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE);
+        ex = ignore ? ex | Native.WS_EX_TRANSPARENT : ex & ~Native.WS_EX_TRANSPARENT;
+        Native.SetWindowLong(hwnd, Native.GWL_EXSTYLE, ex);
+    }
+
+    // 透明視窗收不到滑鼠訊息，所以輪詢游標位置：游標在視窗外慢慢查，進到視窗內才加快
+    bool fastTick;
+    void HitTick()
+    {
+        if (drag != null || hwnd == IntPtr.Zero) return;
+        if (!Native.GetCursorPos(out var p) || !Native.GetWindowRect(hwnd, out var r)) return;
+        bool inside = p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
+        if (inside != fastTick)
+        {
+            fastTick = inside;
+            hitTimer.Interval = TimeSpan.FromMilliseconds(inside ? 33 : 150);
+        }
+        double s = Scale;
+        SetIgnore(!(inside && IsSolid((p.X - r.Left) / s, (p.Y - r.Top) / s)));
+    }
+
+    // ================= 金額 / 時間格式 =================
+    string Money(double usd, int? digits = null)
+    {
+        bool cny = Cfg.Currency == "CNY";
+        double v = cny ? usd * Cfg.CnyRate : usd;
+        string sym = cny ? "¥" : "$";
+        if (v > 0 && v < 0.01) return "<" + sym + "0.01";
+        int d = digits ?? (v < 1 ? 3 : 2);
+        return sym + v.ToString("F" + d, CultureInfo.InvariantCulture);
+    }
+
+    static string FmtReset(long ts)
+    {
+        var d = DateTimeOffset.FromUnixTimeMilliseconds(ts).ToLocalTime();
+        string day = new[] { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }[(int)d.DayOfWeek];
+        int h = d.Hour % 12; if (h == 0) h = 12;
+        return $"{day}{Ui.NB}{h}:{d.Minute:D2}{Ui.NB}{(d.Hour < 12 ? "AM" : "PM")}";
+    }
+
+    bool ShowUsedMode => Cfg.ShowUsed;
+    string Qtxt(double used) => ShowUsedMode ? $"已用 {Ui.JsRound(used)}%" : $"剩 {Ui.JsRound(100 - used)}%";
+
+    double? RemainPct()
+    {
+        if (stats?.Rl?.Week is { } wk) return Math.Max(0, Math.Min(100, 100 - wk.Used));
+        if (stats == null || !(stats.Budget > 0)) return null;
+        return Math.Max(0, Math.Min(100, 100 - stats.Period / stats.Budget.Value * 100));
+    }
+
+    // ================= 量槽 =================
+    (TextBlock pct, Border fill) MakeBar(string label, out Grid row, out Border track)
+    {
+        row = new Grid();
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var l = Ui.Text(label, 11, Ui.RowGrey, align: TextAlignment.Left);
+        l.TextWrapping = TextWrapping.NoWrap;
+        l.TextTrimming = TextTrimming.CharacterEllipsis; // 百分比變長（100% used）時寧可截標題，也不要兩段字疊在一起
+        var p = Ui.Text("…", 11, Ui.Ink, bold: true, align: TextAlignment.Right);
+        p.TextWrapping = TextWrapping.NoWrap;
+        p.HorizontalAlignment = HorizontalAlignment.Right;
+        Grid.SetColumn(p, 1);
+        row.Children.Add(l);
+        row.Children.Add(p);
+        var f = new Border { HorizontalAlignment = HorizontalAlignment.Left, Width = TrackW, CornerRadius = new CornerRadius(3.5), Background = Ui.Coral };
+        track = new Border
+        {
+            Margin = new Thickness(0, 4, 0, 0), Height = 7, CornerRadius = new CornerRadius(3.5), Background = Ui.TrackBg,
+            ClipToBounds = true, Child = f,
+        };
+        return (p, f);
+    }
+
+    void AnimateFill(Border f, double widthPx)
+    {
+        if (f.Tag is double last && Math.Abs(last - widthPx) < 0.01) return; // 沒變就不要重跑動畫（每次重繪都吃 CPU）
+        f.Tag = widthPx;
+        f.BeginAnimation(WidthProperty, new DoubleAnimation(widthPx, TimeSpan.FromMilliseconds(600)) { EasingFunction = new QuadraticEase() });
+    }
+
+    void SetBar(Border fillEl, TextBlock pctEl, double used)
+    {
+        used = Math.Max(0, Math.Min(100, used));
+        double v = ShowUsedMode ? used : 100 - used;
+        pctEl.Text = Ui.JsRound(v) + (ShowUsedMode ? "% used" : "% left");
+        AnimateFill(fillEl, TrackW * v / 100);
+        fillEl.Background = used >= 90 ? Ui.Red : Ui.Coral;
+    }
+
+    public void OnStats(UsageStats s)
+    {
+        stats = s;
+        RenderBadge();
+    }
+
+    void RenderBadge()
+    {
+        if (stats == null) return;
+        var rl = stats.Rl;
+        var five = rl?.Five;
+        fiveBox.Visibility = Cfg.ShowFive ? Visibility.Visible : Visibility.Collapsed;
+        if (Cfg.ShowFive)
+        {
+            if (five != null) SetBar(fill5, pct5, five.Used);
+            else { pct5.Text = "—"; AnimateFill(fill5, 0); }
+        }
+        PlaceBubble(); // 5 小時量槽顯示與否會改變舞台高度
+        var r = RemainPct();
+        var tips = new List<string>();
+        if (Cfg.ShowFive)
+            tips.Add(five != null ? $"5 小時：已用 {Ui.JsRound(five.Used)}% · Resets{Ui.NB}{FmtReset(five.ResetsAt)}" : "5 小時：還沒有官方數字");
+        if (r == null)
+        {
+            pct.Text = "點我校準";
+            AnimateFill(fill, TrackW);
+            fill.Background = Ui.Coral;
+            badge.ToolTip = string.Join("\n", new[] { "還不知道你的每週額度，點一下填當前已用百分比" }.Concat(tips));
+            return;
+        }
+        SetBar(fill, pct, 100 - r.Value);
+        if (rl?.Week is { } wk) tips.Add($"本週：已用 {Ui.JsRound(wk.Used)}%（官方數字）· Resets{Ui.NB}{FmtReset(wk.ResetsAt)}");
+        else tips.Add($"本週已用 {Money(stats.Period, 2)} / 額度 {Money(stats.Budget ?? 0, 0)}（估算）\nResets {FmtReset(stats.NextReset)}");
+        if (stats.RlErr != null) tips.Add("官方額度讀取失敗：" + stats.RlErr);
+        var tip = string.Join("\n", tips);
+        if ((badge.ToolTip as string) != tip) badge.ToolTip = tip;
+    }
+
+    // 點量槽：尚無額度資訊 → 校準；否則切換賬本氣泡
+    void OnBadgeClick()
+    {
+        app.ProbeNow();
+        if (stats != null && !(stats.Budget > 0) && stats.Rl?.Week == null) CalibrateUi();
+        else if (shown && bubbleBody.Child is StackPanel sp && (sp.Tag as string) == "stats") HideBubble();
+        else ShowStatsBubble();
+    }
+
+    // ================= 賬本 / 校準 / 每輪結束 =================
+    public void ShowStatsBubble()
+    {
+        if (stats == null) { SayText("還在翻賬本...等我一下", 3); return; }
+        var s = stats;
+        var panel = new StackPanel { Tag = "stats" };
+        panel.Children.Add(Ui.Text("今日（按 API 價折算）", 11, Ui.Grey));
+        panel.Children.Add(Ui.Text(Money(s.Today, 2), 20, Ui.Coral, bold: true));
+        panel.Children.Add(Ui.Text($"{s.TodayMsgs} 次回覆 · 近 7 天 {Money(s.Week, 2)}", 11, Ui.Grey));
+        if (s.Rl?.Five is { } f5 && Cfg.ShowFive)
+            panel.Children.Add(Ui.Text($"5 小時 {Qtxt(f5.Used)} · Resets{Ui.NB}{FmtReset(f5.ResetsAt)}", 11, Ui.Grey));
+        if (s.Rl?.Week is { } wk)
+            panel.Children.Add(Ui.Text($"本週 {Qtxt(wk.Used)} · Resets{Ui.NB}{FmtReset(wk.ResetsAt)}", 11, Ui.Grey));
+        else if (s.Budget > 0)
+            panel.Children.Add(Ui.Text($"本週 {Money(s.Period, 0)} / {Money(s.Budget.Value, 0)} · {Qtxt(100 - (RemainPct() ?? 0))} · Resets{Ui.NB}{FmtReset(s.NextReset)}", 11, Ui.Grey));
+
+        // 近 7 天長條圖（今日用珊瑚色）
+        double max = Math.Max(s.Days.Select(d => d.Value).DefaultIfEmpty(0).Max(), 0.0001);
+        string todayKey = s.Days[^1].Key;
+        var bars = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Bottom };
+        var barsWrap = new Grid { Height = 46, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 6, 0, 2) };
+        foreach (var (d, v) in s.Days)
+        {
+            var bar = new Grid { Width = 22, Height = Math.Max(2, v / max * 46), VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(2, 0, 2, 0) };
+            bar.Children.Add(new Border
+            {
+                Background = d == todayKey ? Ui.Coral : Ui.BarBg,
+                CornerRadius = new CornerRadius(3, 3, 0, 0),
+            });
+            var lbl = Ui.Text(d.Substring(8), 9, Ui.Grey);
+            lbl.TextWrapping = TextWrapping.NoWrap;
+            lbl.VerticalAlignment = VerticalAlignment.Bottom;
+            lbl.Margin = new Thickness(0, 0, 0, -14);
+            lbl.LineHeight = 12;
+            bar.Children.Add(lbl);
+            bars.Children.Add(bar);
+        }
+        barsWrap.Children.Add(bars);
+        panel.Children.Add(barsWrap);
+        panel.Children.Add(new Border { Height = 14 }); // 日期標籤的位置
+
+        if (s.ByModel.Count > 0)
+        {
+            var tbl = new Grid { HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 4, 0, 0) };
+            tbl.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            tbl.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            int row = 0;
+            foreach (var (m, v) in s.ByModel.OrderByDescending(x => x.Value))
+            {
+                tbl.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                var name = Ui.Text(m.Replace("claude-", ""), 12, Ui.Ink, align: TextAlignment.Left);
+                name.Margin = new Thickness(4, 1, 4, 1); name.TextWrapping = TextWrapping.NoWrap;
+                var cost = Ui.Text(Money(v, 2), 12, Ui.Ink, align: TextAlignment.Right);
+                cost.Margin = new Thickness(4, 1, 4, 1); cost.TextWrapping = TextWrapping.NoWrap;
+                Grid.SetRow(name, row); Grid.SetColumn(name, 0);
+                Grid.SetRow(cost, row); Grid.SetColumn(cost, 1);
+                tbl.Children.Add(name); tbl.Children.Add(cost);
+                row++;
+            }
+            panel.Children.Add(tbl);
+        }
+        Say(panel, 10);
+    }
+
+    public void CalibrateUi()
+    {
+        var panel = new StackPanel();
+        panel.Children.Add(Ui.Text("現在每週額度已經用了多少？", 11, Ui.Grey));
+        var inp = new TextBox
+        {
+            Width = 64, Margin = new Thickness(4, 6, 4, 0), Padding = new Thickness(6, 3, 6, 3),
+            BorderBrush = Ui.Coral, BorderThickness = new Thickness(1.5), Background = Brushes.White, Foreground = Ui.Ink,
+            FontSize = 14, FontFamily = Ui.Font, TextAlignment = TextAlignment.Center, MaxLength = 6,
+            Template = Ui.PlainTextBox(6),
+        };
+        InputMethod.SetIsInputMethodEnabled(inp, false);
+        inp.PreviewTextInput += (_, e) => e.Handled = !e.Text.All(c => char.IsDigit(c) || c == '.');
+        inp.KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter) { app.Calibrate(inp.Text); SayText("校準好啦～", 2); e.Handled = true; }
+            else if (e.Key == Key.Escape) { HideBubble(); e.Handled = true; }
+        };
+        var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
+        row.Children.Add(inp);
+        row.Children.Add(new TextBlock { Text = "%", FontSize = 14, Foreground = Ui.Brown, FontFamily = Ui.Font, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 3) });
+        panel.Children.Add(row);
+        panel.Children.Add(Ui.Text("回車確認 · 小克按本週已花的錢反推額度", 11, Ui.Grey));
+        Say(panel, 0);
+        Activate();
+        inp.Focus();
+        Keyboard.Focus(inp);
+    }
+
+    static string TurnComment(double usd) =>
+        usd < 0.05 ? "這輪很省～" :
+        usd < 0.5 ? "嗯，正常發揮。" :
+        usd < 2 ? "token 燒得也太快了..." :
+        usd < 5 ? "這輪有點貴...我 thinking 了好久..." :
+        "user，該交錢了....";
+
+    public void OnTurn(TurnInfo t)
+    {
+        if (Cfg.TurnSound) app.PlaySound("task-end-a.wav");
+        if (!Cfg.TurnBubble) return;
+        string proj = string.IsNullOrEmpty(t.Cwd) ? "" : t.Cwd.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
+        var panel = new StackPanel();
+        panel.Children.Add(Ui.Text((proj != "" ? proj + " · " : "") + "這輪做完啦", 11, Ui.Grey));
+        panel.Children.Add(Ui.Text(Money(t.Cost), 20, Ui.Coral, bold: true));
+        panel.Children.Add(Ui.Text(TurnComment(t.Cost), 14, Ui.Brown));
+        Say(panel, Cfg.TurnSeconds);
+        Press(160);
+    }
+
+    public void Bye() =>
+        SayText(new[] { "下班啦～拜拜", "Claude Code 關了，我也溜了～", "今天辛苦啦，記得早點睡" }[Rng.Next(3)], 0);
+
+    public void Greet() => SayText("小克上班啦～", 3);
+
+    // ================= 自檢截圖 =================
+    public void Capture(string file) => Ui.Capture(this, file);
+}
