@@ -28,15 +28,15 @@
 
 量槽的數字**只來自 Claude 官方**。抓不到的時候量槽會直接寫「抓不到」（關閉讀取時寫「未啟用」），原因會顯示在量槽的提示裡。
 
-做法是用 Windows ConPTY 在背景開一個隱藏的 `claude`、送 `/usage`、讀畫面上的百分比後關掉：不花 token，啟動時、每輪結束後（至少隔 5 分鐘）和點量槽時各讀一次。要抓得到，需要：
-
-- 電腦上有 `claude` 命令列，且已登入（`claude` → `/login`；桌面版的登入和命令列是兩份，命令列那份過期也會讀不到）。
-- 先在這個資料夾開過一次 `claude` 並信任它，否則會出現 `untrusted`。
-- 網路正常；官方端點偶爾會限流（rate limited），稍後再點量槽重讀即可。
+做法是用 Windows ConPTY 在背景開一個隱藏的 `claude`、送 `/usage`、讀畫面上的百分比後關掉：不花 token，啟動時、每輪結束後（至少隔 5 分鐘）和點量槽時各讀一次。需要先完成[安裝](#安裝)的第 2、3 步（登入命令列、信任資料夾）；官方端點偶爾會限流（rate limited），稍後再點量槽重讀即可。
 
 每週量槽和 5 小時量槽可以各自開關（兩條都關就不顯示量槽，只剩小克）；「讀取官方額度」可整個關掉。量槽只顯示百分比，不顯示重置時間。賬本（今日、近 7 天花費）讀的是本機對話記錄，不需要連線，但只算得到本機 Claude Code 的用量，不含網頁、手機等。
 
 ## 安裝
+
+需要 Windows、[.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)（建置另需 .NET 8 SDK）和 Node.js 18+（只用來跑 hook 和下載素材）。
+
+**1. 下載並建置**
 
 ```bash
 git clone https://github.com/b0sAaa/xiaoke-cc-csharp.git
@@ -46,9 +46,22 @@ npm run build         # dotnet publish → XiaoKe/publish/XiaoKe.exe
 npm run hooks:install # 讓小克跟著 Claude Code 開關
 ```
 
-裝完開個 Claude Code 對話就出來了。
+**2. 登入 Claude Code 命令列**（量槽要靠它才抓得到官方額度）
 
-需要 Windows、[.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)（建置另需 .NET 8 SDK）和 Node.js 18+（只用來跑 hook 和下載素材）。
+```bash
+claude
+/login
+```
+
+桌面版的登入和命令列是兩份，只登入桌面版不夠；命令列那份過期了也會讀不到，重新 `/login` 即可。
+
+**3. 在剛才的資料夾裡開一次 `claude` 並選「信任」**
+
+還在 `xiaoke-cc-csharp` 資料夾裡執行 `claude`，看到「信任這個資料夾嗎」選信任，然後退出。小克在背景讀額度時就是在這個資料夾裡開 `claude`，沒信任過會卡在確認畫面，量槽顯示「抓不到」，提示裡寫 `untrusted`。
+
+**4. 開個 Claude Code 對話，小克就出來了。**
+
+跳過第 2、3 步小克照常運作（花費氣泡、賬本、戳一下都正常），只有量槽會顯示「抓不到」。
 
 ## 致謝
 
