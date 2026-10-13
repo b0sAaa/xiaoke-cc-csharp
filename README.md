@@ -46,8 +46,8 @@
 ## 安裝
 
 ```bash
-git clone https://github.com/b0sAaa/xiaoke-cc-zh-tw.git
-cd xiaoke-cc-zh-tw
+git clone https://github.com/b0sAaa/xiaoke-cc-csharp.git
+cd xiaoke-cc-csharp
 npm run assets        # 下載角色圖和音效（不在倉庫裡）
 npm run build         # dotnet publish → XiaoKe/publish/XiaoKe.exe
 npm run hooks:install # 讓小克跟著 Claude Code 開關
