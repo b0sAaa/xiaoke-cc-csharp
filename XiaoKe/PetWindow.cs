@@ -297,6 +297,11 @@ sealed class PetWindow : Window
         double aspect = src != null ? (double)src.PixelHeight / src.PixelWidth : 1;
         charImg.Width = w;
         charImg.Height = Math.Round(w * aspect);
+        // 量槽跟角色圖一起縮放，但只在 85%~120% 之間：再小字會看不清，再大會太搶眼
+        // （LayoutTransform 會連帶影響版面高度，氣泡位置才會對）
+        double bs = Math.Max(0.85, Math.Min(1.2, Cfg.Scale));
+        badge.LayoutTransform = new ScaleTransform(bs, bs);
+        badge.Margin = new Thickness(0, -16 * bs, 0, 0);
         PlaceBubble();
         if (shown) ScheduleFit();
     }
