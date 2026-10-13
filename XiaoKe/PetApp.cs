@@ -24,8 +24,6 @@ sealed class PetApp
     readonly ProbeOfficialUsage official;
     readonly Dispatcher ui;
     readonly string assets;
-    readonly bool selfTest;
-    readonly string[] args;
 
     PetWindow win = null!;
     QuickWindow? quick;
@@ -45,36 +43,30 @@ sealed class PetApp
 
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string RunName = "XiaoKe";
-    static readonly string[] DayNames = { "週日", "週一", "週二", "週三", "週四", "週五", "週六" };
 
-    public PetApp(System.Windows.Application wpf, string assets, string[] args)
+    public PetApp(System.Windows.Application wpf, string assets)
     {
         this.wpf = wpf;
         this.assets = assets;
-        this.args = args;
         ui = wpf.Dispatcher;
-        official = new ProbeOfficialUsage(ui, () => Cfg.UseReal, ok => { if (ok) OnRealUpdate(); else RefreshStats(); });
-        selfTest = args.Contains("--selftest") || Environment.GetEnvironmentVariable("XK_SELFTEST") != null;
+        official = new ProbeOfficialUsage(ui, () => Cfg.UseReal, _ => RefreshStats());
     }
 
     // ================= 啟動 / 結束 =================
     public void Start()
     {
-        if (!selfTest)
-        {
-            try { Directory.CreateDirectory(Paths.Data); File.WriteAllText(Paths.PidFile, Environment.ProcessId.ToString(CultureInfo.InvariantCulture)); } catch { /* ignore */ }
-        }
+        try { Directory.CreateDirectory(Paths.Data); File.WriteAllText(Paths.PidFile, Environment.ProcessId.ToString(CultureInfo.InvariantCulture)); } catch { /* ignore */ }
 
         win = new PetWindow(this, assets);
         win.Show();
         CreateTray();
 
-        tracker = new UsageTracker(Paths.PricingFile, Paths.UsageCache) { PeriodStart = () => Cfg.PeriodStart() };
+        tracker = new UsageTracker(Paths.PricingFile, Paths.UsageCache);
         tracker.StatsChanged += s => ui.BeginInvoke(() => { LastStats = WithQuota(s); win.OnStats(LastStats); });
-        tracker.Turn += t => ui.BeginInvoke(() => { if (Environment.GetEnvironmentVariable("XK_DEBUG") != null) Log.Info($"turn cost={t.Cost} cwd={t.Cwd}"); win.OnTurn(t); official.Probe(false); });
+        tracker.Turn += t => ui.BeginInvoke(() => { win.OnTurn(t); official.Probe(false); });
         tracker.Start(10_000);
         var firstProbe = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-        firstProbe.Tick += (_, _) => { firstProbe.Stop(); if (!selfTest) official.Probe(true); };
+        firstProbe.Tick += (_, _) => { firstProbe.Stop(); official.Probe(true); };
         firstProbe.Start();
 
         win.OnConfig();
@@ -82,23 +74,10 @@ sealed class PetApp
         greet.Tick += (_, _) => { greet.Stop(); win.Greet(); };
         greet.Start();
 
-        if (Environment.GetEnvironmentVariable("XK_MEMLOG") is { Length: > 0 } memLog)
-        {
-            var mt = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
-            mt.Tick += (_, _) =>
-            {
-                var p = Process.GetCurrentProcess();
-                var gi = GC.GetGCMemoryInfo();
-                File.AppendAllText(memLog, $"{DateTime.Now:HH:mm:ss} ws={p.WorkingSet64 >> 20}MB priv={p.PrivateMemorySize64 >> 20}MB managed={GC.GetTotalMemory(false) >> 20}MB heap={gi.HeapSizeBytes >> 20}MB gen2={GC.CollectionCount(2)}{Environment.NewLine}");
-            };
-            mt.Start();
-        }
-
         var trim = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
         trim.Tick += (_, _) => { trim.Stop(); Native.TrimWorkingSet(); };
         trim.Start();
 
-        if (selfTest) { _ = RunSelfTest(); return; }
         sessionTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
         sessionTimer.Tick += (_, _) => CheckSessions();
         sessionTimer.Start();
@@ -111,7 +90,7 @@ sealed class PetApp
         try { tracker?.Stop(); } catch { /* ignore */ }
         try
         {
-            if (!selfTest && File.Exists(Paths.PidFile) && File.ReadAllText(Paths.PidFile).Trim() == Environment.ProcessId.ToString(CultureInfo.InvariantCulture))
+            if (File.Exists(Paths.PidFile) && File.ReadAllText(Paths.PidFile).Trim() == Environment.ProcessId.ToString(CultureInfo.InvariantCulture))
                 File.Delete(Paths.PidFile);
         }
         catch { /* ignore */ }
@@ -123,22 +102,8 @@ sealed class PetApp
     public void OnSecondInstance() => ui.BeginInvoke(() => { if (!quitting) win.Poke(); });
 
     // ================= 用量 / 額度 =================
-    UsageStats WithQuota(UsageStats st)
-    {
-        if (!(Cfg.WeeklyBudget > 0) && Cfg.CalibrateUsedPct > 0 && st.Period > 0)
-        {
-            Cfg.WeeklyBudget = Ui.JsRound(st.Period / (Cfg.CalibrateUsedPct.Value / 100));
-            Cfg.CalibrateUsedPct = null;
-            Cfg.Save();
-        }
-        return st with
-        {
-            Budget = Cfg.WeeklyBudget,
-            NextReset = Cfg.PeriodStart() + 7 * 86400_000L,
-            Rl = Official.Current(),
-            RlErr = Cfg.UseReal ? official.LastError : null,
-        };
-    }
+    UsageStats WithQuota(UsageStats st) =>
+        st with { Rl = Official.Current(), RlErr = Cfg.UseReal ? official.LastError : null, RlTried = official.Tried };
 
     /// <summary>點量槽時順便讀一次官方額度（至少隔 20 秒）。</summary>
     public void ProbeNow() => official.Probe(true);
@@ -150,35 +115,6 @@ sealed class PetApp
         win.OnStats(LastStats);
     }
 
-    // 讀到官方數字：重置時間跟官方一致，並用官方百分比校準估算（讀不到官方數字時退回估算也比較準）
-    void OnRealUpdate()
-    {
-        var w = official.Raw?.Week;
-        if (w != null)
-        {
-            // 分鐘四捨五入到整點，例如 13:59 → 14:00
-            var d = DateTimeOffset.FromUnixTimeMilliseconds(w.ResetsAt + 30 * 60_000L).ToLocalTime();
-            if ((int)d.DayOfWeek != Cfg.ResetDay || d.Hour != Cfg.ResetHour) { Cfg.ResetDay = (int)d.DayOfWeek; Cfg.ResetHour = d.Hour; }
-            if (w.Used >= 10)
-            {
-                double period = tracker.GetStats().Period;
-                if (period > 0) Cfg.WeeklyBudget = Ui.JsRound(period / (w.Used / 100));
-            }
-            Cfg.Save();
-        }
-        RefreshStats();
-    }
-
-    public void Calibrate(string text)
-    {
-        if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var pct)) return;
-        if (!(pct > 0 && pct <= 100) || LastStats == null || !(LastStats.Period > 0)) return;
-        Cfg.WeeklyBudget = Ui.JsRound(LastStats.Period / (pct / 100));
-        Cfg.Save();
-        LastStats = WithQuota(LastStats);
-        win.OnStats(LastStats);
-    }
-
     void SetCfg(Action<Config> patch)
     {
         patch(Cfg);
@@ -186,15 +122,8 @@ sealed class PetApp
         win.OnConfig();
     }
 
-    // 改額度重置時間：存設定、用新的週期重算本週已花，馬上更新量槽
-    void SetReset(Action<Config> patch)
-    {
-        SetCfg(patch);
-        LastStats = WithQuota(tracker.GetStats());
-        win.OnStats(LastStats);
-    }
-
-    public void PlaySound(string file) => Sound.Play(assets, file, Cfg.Volume);
+    /// <summary>所有音效（按壓、每輪結束）共用一個開關。</summary>
+    public void PlaySound(string file) { if (Cfg.Sound) Sound.Play(assets, file, Cfg.Volume); }
 
     // ================= 快速輸入框 =================
     public void OpenQuick()
@@ -362,25 +291,14 @@ sealed class PetApp
         m.Clear();
         Add(m, "看看賬本", () => win.ShowStatsBubble());
         Add(m, "問 Claude…（雙擊小克）", OpenQuick);
-        // 讀得到官方數字時會自動校準估算，這項只在讀不到時才需要
-        if (Official.Current() == null) Add(m, "校準每週額度…", () => win.CalibrateUi());
         Add(m, "讀取官方額度（Claude Code /usage）", () => { SetCfg(c => c.UseReal = !c.UseReal); if (Cfg.UseReal) official.Probe(true); else RefreshStats(); }, Cfg.UseReal);
+        Add(m, "顯示每週量槽", () => SetCfg(c => c.ShowWeek = !c.ShowWeek), Cfg.ShowWeek);
         Add(m, "顯示 5 小時量槽", () => SetCfg(c => c.ShowFive = !c.ShowFive), Cfg.ShowFive);
 
         var show = new Forms.ToolStripMenuItem("量槽顯示方式");
         Add(show.DropDownItems, "已用（同 Claude）", () => SetCfg(c => c.ShowUsed = true), Cfg.ShowUsed);
         Add(show.DropDownItems, "剩餘", () => SetCfg(c => c.ShowUsed = false), !Cfg.ShowUsed);
         m.Add(show);
-        Add(m, "立即更新官方額度", () => official.Probe(true), enabled: Cfg.UseReal);
-
-        var reset = new Forms.ToolStripMenuItem($"額度重置時間（{DayNames[Cfg.ResetDay]} {Cfg.ResetHour:D2}:00）");
-        var days = new Forms.ToolStripMenuItem("星期");
-        for (int i = 0; i < 7; i++) { int d = i; Add(days.DropDownItems, DayNames[i], () => SetReset(c => c.ResetDay = d), Cfg.ResetDay == i); }
-        var hours = new Forms.ToolStripMenuItem("時間");
-        for (int i = 0; i < 24; i++) { int h = i; Add(hours.DropDownItems, $"{i:D2}:00", () => SetReset(c => c.ResetHour = h), Cfg.ResetHour == i); }
-        reset.DropDownItems.Add(days);
-        reset.DropDownItems.Add(hours);
-        m.Add(reset);
 
         Add(m, "戳一下", () => win.Poke());
         m.Add(new Forms.ToolStripSeparator());
@@ -393,15 +311,8 @@ sealed class PetApp
         }
         m.Add(size);
 
-        var cur = new Forms.ToolStripMenuItem("貨幣");
-        Add(cur.DropDownItems, "美元 $", () => SetCfg(c => c.Currency = "USD"), Cfg.Currency == "USD");
-        Add(cur.DropDownItems, $"人民幣 ¥（匯率 {Cfg.CnyRate.ToString(CultureInfo.InvariantCulture)}）", () => SetCfg(c => c.Currency = "CNY"), Cfg.Currency == "CNY");
-        m.Add(cur);
-
-        Add(m, "按壓音效", () => SetCfg(c => c.Sound = !c.Sound), Cfg.Sound);
+        Add(m, "音效", () => SetCfg(c => c.Sound = !c.Sound), Cfg.Sound);
         Add(m, "每輪結束冒泡", () => SetCfg(c => c.TurnBubble = !c.TurnBubble), Cfg.TurnBubble);
-        Add(m, "每輪結束提示音", () => SetCfg(c => c.TurnSound = !c.TurnSound), Cfg.TurnSound);
-        Add(m, "試聽提示音（叮）", () => PlaySound("task-end-a.wav"));
         Add(m, "跟著 Claude Code 開關", () => SetCfg(c => c.FollowClaude = !c.FollowClaude), Cfg.FollowClaude);
         Add(m, "開機自啟", () => SetAutostart(!AutostartOn()), AutostartOn());
         m.Add(new Forms.ToolStripSeparator());
@@ -412,24 +323,5 @@ sealed class PetApp
         Add(m, "回到右下角", () => { win.ResetPosition(); SetCfg(c => { c.X = null; c.Y = null; }); });
         m.Add(new Forms.ToolStripSeparator());
         Add(m, "退出", Quit);
-    }
-
-    // ================= 自檢：依次截圖「待機 / 戳一下 / 賬本 / 一輪結束 / 校準 / 快速輸入框」 =================
-    async Task RunSelfTest()
-    {
-        var dir = args.SkipWhile(a => a != "--selftest").Skip(1).FirstOrDefault(a => !a.StartsWith("--"))
-                  ?? Environment.GetEnvironmentVariable("XK_SELFTEST") ?? Path.Combine(Paths.AppDir, "selftest");
-        if (dir == "1") dir = Path.Combine(Paths.AppDir, "selftest");
-        Directory.CreateDirectory(dir);
-        for (int i = 0; i < 60 && LastStats == null; i++) await Task.Delay(1000);
-        await Task.Delay(1500);
-        win.Capture(Path.Combine(dir, "1-idle.png"));
-        win.Poke(); await Task.Delay(800); win.Capture(Path.Combine(dir, "2-poke.png"));
-        win.ShowStatsBubble(); await Task.Delay(800); win.Capture(Path.Combine(dir, "3-stats.png"));
-        win.OnTurn(new TurnInfo("x", 0.4213, "claude-opus-5-5", "D:/projects/demo")); await Task.Delay(800); win.Capture(Path.Combine(dir, "4-turn.png"));
-        win.CalibrateUi(); await Task.Delay(800); win.Capture(Path.Combine(dir, "5-calibrate.png"));
-        OpenQuick(); await Task.Delay(500);
-        if (quick != null) Ui.Capture(quick, Path.Combine(dir, "6-quick.png"));
-        Quit();
     }
 }

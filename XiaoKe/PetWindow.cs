@@ -33,6 +33,7 @@ sealed class PetWindow : Window
     readonly ScaleTransform charScale = new(1, 1);
     readonly Border badge = new();
     readonly StackPanel fiveBox = new();
+    readonly StackPanel weekBox = new();
     readonly TextBlock pct5, pct;
     readonly Border fill5, fill;
     readonly Grid bubbleHost = new();
@@ -131,8 +132,9 @@ sealed class PetWindow : Window
         fiveBox.Visibility = Visibility.Collapsed;
         badgeStack.Children.Add(fiveBox);
         (pct, fill) = MakeBar("Weekly · all models", out var wRow, out var wTrack);
-        badgeStack.Children.Add(wRow);
-        badgeStack.Children.Add(wTrack);
+        weekBox.Children.Add(wRow);
+        weekBox.Children.Add(wTrack);
+        badgeStack.Children.Add(weekBox);
         badge.Child = badgeStack;
         badge.MouseLeftButtonUp += (_, e) => { OnBadgeClick(); e.Handled = true; };
 
@@ -418,7 +420,7 @@ sealed class PetWindow : Window
     public void Poke()
     {
         Press(140);
-        if (Cfg.Sound) app.PlaySound(PokeSounds[Rng.Next(PokeSounds.Length)]);
+        app.PlaySound(PokeSounds[Rng.Next(PokeSounds.Length)]);
         SayText(PickLine(), 4);
     }
 
@@ -538,33 +540,15 @@ sealed class PetWindow : Window
     }
 
     // ================= 金額 / 時間格式 =================
-    string Money(double usd, int? digits = null)
+    static string Money(double usd, int? digits = null)
     {
-        bool cny = Cfg.Currency == "CNY";
-        double v = cny ? usd * Cfg.CnyRate : usd;
-        string sym = cny ? "¥" : "$";
-        if (v > 0 && v < 0.01) return "<" + sym + "0.01";
-        int d = digits ?? (v < 1 ? 3 : 2);
-        return sym + v.ToString("F" + d, CultureInfo.InvariantCulture);
-    }
-
-    static string FmtReset(long ts)
-    {
-        var d = DateTimeOffset.FromUnixTimeMilliseconds(ts).ToLocalTime();
-        string day = new[] { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }[(int)d.DayOfWeek];
-        int h = d.Hour % 12; if (h == 0) h = 12;
-        return $"{day}{Ui.NB}{h}:{d.Minute:D2}{Ui.NB}{(d.Hour < 12 ? "AM" : "PM")}";
+        if (usd > 0 && usd < 0.01) return "<$0.01";
+        int d = digits ?? (usd < 1 ? 3 : 2);
+        return "$" + usd.ToString("F" + d, CultureInfo.InvariantCulture);
     }
 
     bool ShowUsedMode => Cfg.ShowUsed;
     string Qtxt(double used) => ShowUsedMode ? $"已用 {Ui.JsRound(used)}%" : $"剩 {Ui.JsRound(100 - used)}%";
-
-    double? RemainPct()
-    {
-        if (stats?.Rl?.Week is { } wk) return Math.Max(0, Math.Min(100, 100 - wk.Used));
-        if (stats == null || !(stats.Budget > 0)) return null;
-        return Math.Max(0, Math.Min(100, 100 - stats.Period / stats.Budget.Value * 100));
-    }
 
     // ================= 量槽 =================
     (TextBlock pct, Border fill) MakeBar(string label, out Grid row, out Border track)
@@ -618,42 +602,53 @@ sealed class PetWindow : Window
         var rl = stats.Rl;
         var five = rl?.Five;
         fiveBox.Visibility = Cfg.ShowFive ? Visibility.Visible : Visibility.Collapsed;
+        fiveBox.Margin = new Thickness(0, 0, 0, Cfg.ShowWeek ? 6 : 0);
+        weekBox.Visibility = Cfg.ShowWeek ? Visibility.Visible : Visibility.Collapsed;
+        badge.Visibility = Cfg.ShowFive || Cfg.ShowWeek ? Visibility.Visible : Visibility.Collapsed; // 兩條都關就整個量槽不顯示
         if (Cfg.ShowFive)
         {
             if (five != null) SetBar(fill5, pct5, five.Used);
             else { pct5.Text = "—"; AnimateFill(fill5, 0); }
         }
-        PlaceBubble(); // 5 小時量槽顯示與否會改變舞台高度
-        var r = RemainPct();
+        PlaceBubble(); // 量槽顯示與否會改變舞台高度
         var tips = new List<string>();
         if (Cfg.ShowFive)
-            tips.Add(five != null ? $"5 小時：已用 {Ui.JsRound(five.Used)}% · Resets{Ui.NB}{FmtReset(five.ResetsAt)}" : "5 小時：還沒有官方數字");
-        if (r == null)
+            tips.Add(five != null ? $"5 小時：已用 {Ui.JsRound(five.Used)}%" : "5 小時：還沒有官方數字");
+        if (!Cfg.ShowWeek)
         {
-            pct.Text = "點我校準";
-            AnimateFill(fill, TrackW);
-            fill.Background = Ui.Coral;
-            badge.ToolTip = string.Join("\n", new[] { "還不知道你的每週額度，點一下填當前已用百分比" }.Concat(tips));
+            var t5 = string.Join("\n", tips);
+            if ((badge.ToolTip as string) != t5) badge.ToolTip = t5;
             return;
         }
-        SetBar(fill, pct, 100 - r.Value);
-        if (rl?.Week is { } wk) tips.Add($"本週：已用 {Ui.JsRound(wk.Used)}%（官方數字）· Resets{Ui.NB}{FmtReset(wk.ResetsAt)}");
-        else tips.Add($"本週已用 {Money(stats.Period, 2)} / 額度 {Money(stats.Budget ?? 0, 0)}（估算）\nResets {FmtReset(stats.NextReset)}");
-        if (stats.RlErr != null) tips.Add("官方額度讀取失敗：" + stats.RlErr);
+        if (rl?.Week is not { } wk)
+        {
+            // 抓不到官方數字就老實說，不估算
+            bool off = !Cfg.UseReal;
+            pct.Text = off ? "未啟用" : stats.RlTried ? "抓不到" : "讀取中…";
+            AnimateFill(fill, 0);
+            fill.Background = Ui.Coral;
+            tips.Insert(0, off ? "已關閉官方額度讀取（右鍵 → 讀取官方額度 可開啟）"
+                : stats.RlErr != null ? "官方額度讀取失敗：" + stats.RlErr + "\n需要電腦上有 claude 命令列且已登入才讀得到"
+                : stats.RlTried ? "目前沒有有效的官方數字，點我重新讀取"
+                : "正在讀取官方額度…");
+            badge.ToolTip = string.Join("\n", tips);
+            return;
+        }
+        SetBar(fill, pct, wk.Used);
+        tips.Add($"本週：已用 {Ui.JsRound(wk.Used)}%（官方數字）");
         var tip = string.Join("\n", tips);
         if ((badge.ToolTip as string) != tip) badge.ToolTip = tip;
     }
 
-    // 點量槽：尚無額度資訊 → 校準；否則切換賬本氣泡
+    // 點量槽：順便重新讀官方額度，並切換賬本氣泡
     void OnBadgeClick()
     {
         app.ProbeNow();
-        if (stats != null && !(stats.Budget > 0) && stats.Rl?.Week == null) CalibrateUi();
-        else if (shown && bubbleBody.Child is StackPanel sp && (sp.Tag as string) == "stats") HideBubble();
+        if (shown && bubbleBody.Child is StackPanel sp && (sp.Tag as string) == "stats") HideBubble();
         else ShowStatsBubble();
     }
 
-    // ================= 賬本 / 校準 / 每輪結束 =================
+    // ================= 賬本 / 每輪結束 =================
     public void ShowStatsBubble()
     {
         if (stats == null) { SayText("還在翻賬本...等我一下", 3); return; }
@@ -663,11 +658,14 @@ sealed class PetWindow : Window
         panel.Children.Add(Ui.Text(Money(s.Today, 2), 20, Ui.Coral, bold: true));
         panel.Children.Add(Ui.Text($"{s.TodayMsgs} 次回覆 · 近 7 天 {Money(s.Week, 2)}", 11, Ui.Grey));
         if (s.Rl?.Five is { } f5 && Cfg.ShowFive)
-            panel.Children.Add(Ui.Text($"5 小時 {Qtxt(f5.Used)} · Resets{Ui.NB}{FmtReset(f5.ResetsAt)}", 11, Ui.Grey));
-        if (s.Rl?.Week is { } wk)
-            panel.Children.Add(Ui.Text($"本週 {Qtxt(wk.Used)} · Resets{Ui.NB}{FmtReset(wk.ResetsAt)}", 11, Ui.Grey));
-        else if (s.Budget > 0)
-            panel.Children.Add(Ui.Text($"本週 {Money(s.Period, 0)} / {Money(s.Budget.Value, 0)} · {Qtxt(100 - (RemainPct() ?? 0))} · Resets{Ui.NB}{FmtReset(s.NextReset)}", 11, Ui.Grey));
+            panel.Children.Add(Ui.Text($"5 小時 {Qtxt(f5.Used)}", 11, Ui.Grey));
+        if (Cfg.ShowWeek)
+        {
+            if (s.Rl?.Week is { } wk)
+                panel.Children.Add(Ui.Text($"本週 {Qtxt(wk.Used)}", 11, Ui.Grey));
+            else
+                panel.Children.Add(Ui.Text("本週額度：抓不到官方數字", 11, Ui.Grey));
+        }
 
         // 近 7 天長條圖（今日用珊瑚色）
         double max = Math.Max(s.Days.Select(d => d.Value).DefaultIfEmpty(0).Max(), 0.0001);
@@ -717,35 +715,6 @@ sealed class PetWindow : Window
         Say(panel, 10);
     }
 
-    public void CalibrateUi()
-    {
-        var panel = new StackPanel();
-        panel.Children.Add(Ui.Text("現在每週額度已經用了多少？", 11, Ui.Grey));
-        var inp = new TextBox
-        {
-            Width = 64, Margin = new Thickness(4, 6, 4, 0), Padding = new Thickness(6, 3, 6, 3),
-            BorderBrush = Ui.Coral, BorderThickness = new Thickness(1.5), Background = Brushes.White, Foreground = Ui.Ink,
-            FontSize = 14, FontFamily = Ui.Font, TextAlignment = TextAlignment.Center, MaxLength = 6,
-            Template = Ui.PlainTextBox(6),
-        };
-        InputMethod.SetIsInputMethodEnabled(inp, false);
-        inp.PreviewTextInput += (_, e) => e.Handled = !e.Text.All(c => char.IsDigit(c) || c == '.');
-        inp.KeyDown += (_, e) =>
-        {
-            if (e.Key == Key.Enter) { app.Calibrate(inp.Text); SayText("校準好啦～", 2); e.Handled = true; }
-            else if (e.Key == Key.Escape) { HideBubble(); e.Handled = true; }
-        };
-        var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
-        row.Children.Add(inp);
-        row.Children.Add(new TextBlock { Text = "%", FontSize = 14, Foreground = Ui.Brown, FontFamily = Ui.Font, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 3) });
-        panel.Children.Add(row);
-        panel.Children.Add(Ui.Text("回車確認 · 小克按本週已花的錢反推額度", 11, Ui.Grey));
-        Say(panel, 0);
-        Activate();
-        inp.Focus();
-        Keyboard.Focus(inp);
-    }
-
     static string TurnComment(double usd) =>
         usd < 0.05 ? "這輪很省～" :
         usd < 0.5 ? "嗯，正常發揮。" :
@@ -755,7 +724,7 @@ sealed class PetWindow : Window
 
     public void OnTurn(TurnInfo t)
     {
-        if (Cfg.TurnSound) app.PlaySound("task-end-a.wav");
+        app.PlaySound("task-end-a.wav");
         if (!Cfg.TurnBubble) return;
         string proj = string.IsNullOrEmpty(t.Cwd) ? "" : t.Cwd.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
         var panel = new StackPanel();
@@ -770,7 +739,4 @@ sealed class PetWindow : Window
         SayText(new[] { "下班啦～拜拜", "Claude Code 關了，我也溜了～", "今天辛苦啦，記得早點睡" }[Rng.Next(3)], 0);
 
     public void Greet() => SayText("小克上班啦～", 3);
-
-    // ================= 自檢截圖 =================
-    public void Capture(string file) => Ui.Capture(this, file);
 }

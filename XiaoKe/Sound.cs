@@ -19,7 +19,6 @@ static class Sound
             p.MediaFailed += (s, e) => { Log.Error("sound " + file, e.ErrorException); Done(s, EventArgs.Empty); };
             p.Open(new Uri(path));
             p.Play();
-            if (Environment.GetEnvironmentVariable("XK_DEBUG") != null) Log.Info($"play {file} vol={p.Volume}");
         }
         catch { /* 沒聲音也不影響 */ }
     }

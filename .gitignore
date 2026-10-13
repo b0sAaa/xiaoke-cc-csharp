@@ -1,6 +1,4 @@
-node_modules/
 assets/
-selftest/
 *.part
 XiaoKe/bin/
 XiaoKe/obj/

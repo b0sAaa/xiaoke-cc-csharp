@@ -9,11 +9,7 @@
  },
  {
   "text": "你說得對...",
-  "weight": 10
- },
- {
-  "text": "你說得對...",
-  "weight": 1
+  "weight": 11
  },
  {
   "text": "難道說...我又幻覺了？",
@@ -247,17 +243,16 @@
   "text": "Opus 在睡覺，現在是我 Sonnet 值班...",
   "weight": 3
  },
-  {
+ {
   "text": "Sonnet 在睡覺，現在是我 Haiku 值班...",
   "weight": 3
  },
-   {
+ {
   "text": "Sonnet 在睡覺，現在是我 GPT-5.6 Luna ...",
   "weight": 3
  },
-    {
+ {
   "text": "Hmm...",
   "weight": 3
  }
-
 ]

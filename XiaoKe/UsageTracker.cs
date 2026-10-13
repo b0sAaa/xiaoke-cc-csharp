@@ -9,8 +9,7 @@ using System.Threading;
 namespace XiaoKe;
 
 // 讀取 Claude Code 本地對話記錄（~/.claude/projects/**/*.jsonl），按 API 價格估算花費。
-// 與 Electron 版 usage.js 邏輯等價：
-// - 只掃最近 KeepDays 天改動過的檔案；按位元組偏移量增量讀取，結果快取到磁碟（usage-cache.json，格式 v3 與原版相同）。
+// - 只掃最近 KeepDays 天改動過的檔案；按位元組偏移量增量讀取，結果快取到磁碟（usage-cache.json）。
 // - 同一條回覆會分多行寫入（message.id + requestId 相同），以最後一行的 usage 為準。
 // - 主對話裡出現 stop_reason=end_turn 時視為「一輪結束」，把這一輪（含子代理）的花費發出去。
 
@@ -90,14 +89,12 @@ sealed record TurnInfo(string SessionId, double Cost, string? Model, string? Cwd
 sealed record UsageStats(
     double Today, int TodayMsgs, double Week,
     List<KeyValuePair<string, double>> Days,
-    List<KeyValuePair<string, double>> ByModel,
-    double Period, long PeriodStart)
+    List<KeyValuePair<string, double>> ByModel)
 {
     // 以下由 PetApp.WithQuota 補上
-    public double? Budget { get; init; }
-    public long NextReset { get; init; }
     public OfficialQuota? Rl { get; init; }
     public string? RlErr { get; init; }
+    public bool RlTried { get; init; } // 這次執行期間是否已經讀過至少一次官方額度（不論成敗）
 }
 
 sealed class UsageTracker
@@ -119,7 +116,6 @@ sealed class UsageTracker
     long lastSave;
     CancellationTokenSource? cts;
 
-    public Func<long> PeriodStart { get; set; } = () => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 7 * 86400_000L;
     public event Action<TurnInfo>? Turn;
     public event Action<UsageStats>? StatsChanged;
 
@@ -385,13 +381,11 @@ sealed class UsageTracker
         }
         var byModel = new List<KeyValuePair<string, double>>();
         var mIdx = new Dictionary<string, int>();
-        double todayCost = 0, period = 0;
+        double todayCost = 0;
         int todayMsgs = 0;
-        long since = PeriodStart();
         foreach (var e in entries.Values)
         {
             if (idx.TryGetValue(e.D, out var di)) days[di] = new(days[di].Key, days[di].Value + e.C);
-            if (e.T >= since) period += e.C;
             if (e.D == today)
             {
                 todayCost += e.C;
@@ -403,7 +397,7 @@ sealed class UsageTracker
         }
         double week = 0;
         foreach (var d in days) week += d.Value;
-        return new UsageStats(todayCost, todayMsgs, week, days, byModel, period, since);
+        return new UsageStats(todayCost, todayMsgs, week, days, byModel);
     }
 
     // ---------- 生命週期 ----------

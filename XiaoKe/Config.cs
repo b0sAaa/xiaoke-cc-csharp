@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace XiaoKe;
 
-/// <summary>固定路徑。資料夾與 Electron 版的 userData 相同（hook.js 也寫這裡）。</summary>
+/// <summary>固定路徑（hook.js 也寫這裡）。</summary>
 static class Paths
 {
     public static readonly string Data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "xiaoke-cc");
@@ -33,7 +33,7 @@ static class Paths
     }
 }
 
-/// <summary>config.json：欄位名稱與 Electron 版完全相同。</summary>
+/// <summary>config.json。</summary>
 sealed class Config
 {
     public double? X { get; set; }
@@ -42,16 +42,10 @@ sealed class Config
     public bool Sound { get; set; } = true;
     public double Volume { get; set; } = 0.5;
     public bool TurnBubble { get; set; } = true;
-    public bool TurnSound { get; set; } = true;
     public double TurnSeconds { get; set; } = 8;
-    public string Currency { get; set; } = "USD";
-    public double CnyRate { get; set; } = 7.1;
     public bool FollowClaude { get; set; } = true;
-    public int ResetDay { get; set; } = 4;
-    public int ResetHour { get; set; } = 1;
-    public double? WeeklyBudget { get; set; }
-    public double? CalibrateUsedPct { get; set; }
     public bool UseReal { get; set; } = true;
+    public bool ShowWeek { get; set; } = true;
     public bool ShowFive { get; set; }
     public bool ShowUsed { get; set; } = true;
 
@@ -76,16 +70,6 @@ sealed class Config
             File.WriteAllText(Paths.ConfigFile, JsonSerializer.Serialize(this, Opts));
         }
         catch { /* ignore */ }
-    }
-
-    /// <summary>最近一次重置時刻（本地時間 resetDay 星期幾 resetHour 點），毫秒時間戳。</summary>
-    public long PeriodStart(DateTime? nowLocal = null)
-    {
-        var now = nowLocal ?? DateTime.Now;
-        var d = now.Date.AddHours(ResetHour);
-        d = d.AddDays(-(((int)d.DayOfWeek - ResetDay + 7) % 7));
-        if (d > now) d = d.AddDays(-7);
-        return new DateTimeOffset(d).ToUnixTimeMilliseconds();
     }
 }
 
@@ -113,7 +97,7 @@ sealed record OfficialQuota(QuotaWindow? Week, QuotaWindow? Five);
 
 interface IOfficialUsage
 {
-    /// <summary>目前仍有效的官方數字；沒有就回傳 null，畫面退回「估算 + 點量槽校準」。</summary>
+    /// <summary>目前仍有效的官方數字；沒有就回傳 null，量槽顯示「抓不到」。</summary>
     OfficialQuota? Current();
 }
 

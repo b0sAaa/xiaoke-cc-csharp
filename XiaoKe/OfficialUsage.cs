@@ -16,7 +16,7 @@ namespace XiaoKe;
 /// <summary>
 /// 官方額度：開一個隱藏的互動式 claude（Windows ConPTY，停用 hook），送 /usage，讀畫面上的
 /// 「Current session」與「Current week (all models)」百分比與重置時間，然後關掉。
-/// 只開畫面、不送對話，所以不花 token。與 Electron 版 scripts/probe-usage.js 邏輯等價。
+/// 只開畫面、不送對話，所以不花 token。
 /// 啟動時、每輪結束後（至少隔 5 分鐘）、點量槽時各讀一次。
 /// </summary>
 sealed class ProbeOfficialUsage : IOfficialUsage
@@ -30,12 +30,12 @@ sealed class ProbeOfficialUsage : IOfficialUsage
     readonly Action<bool> onDone; // 讀完（成功與否）通知主程式更新畫面；參數 = 是否成功
 
     OfficialQuota? real;
-    long realAt;
     bool probing;
     DateTime lastProbe = DateTime.MinValue;
     DispatcherTimer? retryTimer;
 
     public string? LastError { get; private set; }
+    public bool Tried { get; private set; }
 
     public ProbeOfficialUsage(Dispatcher ui, Func<bool> enabled, Action<bool> onDone)
     {
@@ -45,7 +45,7 @@ sealed class ProbeOfficialUsage : IOfficialUsage
         LoadSaved();
     }
 
-    /// <summary>目前還有效（重置時間還沒過）的官方數字；沒有就回傳 null，畫面退回估算。</summary>
+    /// <summary>目前還有效（重置時間還沒過）的官方數字；沒有就回傳 null，量槽顯示「抓不到」。</summary>
     public OfficialQuota? Current()
     {
         if (!enabled() || real == null) return null;
@@ -55,8 +55,6 @@ sealed class ProbeOfficialUsage : IOfficialUsage
         var five = Pick(real.Five);
         return week != null || five != null ? new OfficialQuota(week, five) : null;
     }
-
-    public OfficialQuota? Raw => real;
 
     // ---------- 排程 ----------
     public void Probe(bool force)
@@ -76,7 +74,6 @@ sealed class ProbeOfficialUsage : IOfficialUsage
         }
         probing = true;
         lastProbe = DateTime.UtcNow;
-        if (Environment.GetEnvironmentVariable("XK_DEBUG") != null) Log.Info("開始讀取官方額度 force=" + force);
         var cwd = ProbeCwd();
         var th = new Thread(() =>
         {
@@ -92,10 +89,10 @@ sealed class ProbeOfficialUsage : IOfficialUsage
     void Finish(ProbeResult r)
     {
         probing = false;
+        Tried = true;
         if (r.Ok)
         {
             real = new OfficialQuota(r.Week, r.Session);
-            realAt = r.At;
             LastError = null;
             Save();
         }
@@ -113,7 +110,7 @@ sealed class ProbeOfficialUsage : IOfficialUsage
         return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
     }
 
-    // ---------- 存檔（real-usage.json，格式與 Electron 版相同） ----------
+    // ---------- 存檔（real-usage.json） ----------
     void LoadSaved()
     {
         try
@@ -124,7 +121,6 @@ sealed class ProbeOfficialUsage : IOfficialUsage
                 o.TryGetProperty(name, out var w) && w.ValueKind == JsonValueKind.Object && w.TryGetProperty("pct", out var p) && w.TryGetProperty("resetsAt", out var r)
                     ? new QuotaWindow(p.GetDouble(), (long)r.GetDouble()) : null;
             real = new OfficialQuota(W("week"), W("session"));
-            realAt = o.TryGetProperty("at", out var at) ? (long)at.GetDouble() : 0;
         }
         catch { /* 還沒讀過 */ }
     }
@@ -135,15 +131,15 @@ sealed class ProbeOfficialUsage : IOfficialUsage
         {
             object? W(QuotaWindow? w) => w == null ? null : new { pct = w.Used, resetsAt = w.ResetsAt };
             Directory.CreateDirectory(Paths.Data);
-            File.WriteAllText(RealFile, JsonSerializer.Serialize(new { ok = true, at = realAt, session = W(real?.Five), week = W(real?.Week) }));
+            File.WriteAllText(RealFile, JsonSerializer.Serialize(new { ok = true, session = W(real?.Five), week = W(real?.Week) }));
         }
         catch { /* ignore */ }
     }
 }
 
-sealed record ProbeResult(bool Ok, string? Error, long At, QuotaWindow? Session, QuotaWindow? Week)
+sealed record ProbeResult(bool Ok, string? Error, QuotaWindow? Session, QuotaWindow? Week)
 {
-    public static ProbeResult Fail(string error) => new(false, error, 0, null, null);
+    public static ProbeResult Fail(string error) => new(false, error, null, null);
 }
 
 /// <summary>在 ConPTY 裡跑一次 claude，讀 /usage 畫面。</summary>
@@ -268,10 +264,9 @@ static class ProbeRunner
                 // 再等一下讓畫面更新完，取最後一次的數字
                 Thread.Sleep(700);
                 var t2 = Strip(pty.Output());
-                return new ProbeResult(true, null, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Grab(t2, SessionLabel) ?? session, Grab(t2, WeekLabel) ?? week);
+                return new ProbeResult(true, null, Grab(t2, SessionLabel) ?? session, Grab(t2, WeekLabel) ?? week);
             }
         }
-        if (Environment.GetEnvironmentVariable("XK_PROBE_DUMP") is { Length: > 0 } dump) { try { File.WriteAllText(dump, last); } catch { /* ignore */ } }
         return ProbeResult.Fail("timeout：" + Tail(last));
     }
 }

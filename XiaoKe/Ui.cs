@@ -8,8 +8,6 @@ namespace XiaoKe;
 
 static class Ui
 {
-    public const string NB = " "; // 不換行空格：避免「Resets 時間」被拆成兩行
-
     public static SolidColorBrush Br(string hex)
     {
         var b = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex));
@@ -47,23 +45,6 @@ static class Ui
             LineHeight = size * 1.45, LineStackingStrategy = LineStackingStrategy.BlockLineHeight,
         };
         return t;
-    }
-
-    /// <summary>把視窗內容存成 PNG（疊在淺灰底上方便肉眼檢查透明區域）。</summary>
-    public static void Capture(Window w, string file)
-    {
-        w.UpdateLayout();
-        double s = VisualTreeHelper.GetDpi(w).DpiScaleX;
-        int pw = (int)Math.Round(w.ActualWidth * s), ph = (int)Math.Round(w.ActualHeight * s);
-        var dv = new DrawingVisual();
-        using (var dc = dv.RenderOpen()) dc.DrawRectangle(Brushes.LightGray, null, new Rect(0, 0, w.ActualWidth, w.ActualHeight));
-        var rtb = new System.Windows.Media.Imaging.RenderTargetBitmap(pw, ph, 96 * s, 96 * s, PixelFormats.Pbgra32);
-        rtb.Render(dv);
-        rtb.Render(w);
-        var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
-        enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(rtb));
-        using var fs = System.IO.File.Create(file);
-        enc.Save(fs);
     }
 
     /// <summary>沒有聚焦 / 滑過特效的 TextBox 外觀（預設樣板聚焦時會把邊框變成系統藍色）。</summary>
