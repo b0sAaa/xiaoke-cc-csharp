@@ -32,6 +32,7 @@ sealed class PetApp
     Forms.ContextMenuStrip menu = null!;
     Icon? trayIcon;
     DispatcherTimer? sessionTimer;
+    FileSystemWatcher? attnWatcher;
     bool quitting;
 
     // 跟著 Claude Code 開關
@@ -62,7 +63,7 @@ sealed class PetApp
         CreateTray();
 
         tracker = new UsageTracker(Paths.PricingFile, Paths.UsageCache);
-        tracker.StatsChanged += s => ui.BeginInvoke(() => { LastStats = WithQuota(s); win.OnStats(LastStats); });
+        tracker.StatsChanged += s => ui.BeginInvoke(() => { LastStats = WithQuota(s); win.OnStats(LastStats); CheckBudget(LastStats); });
         tracker.Turn += t => ui.BeginInvoke(() => { win.OnTurn(t); official.Probe(false); });
         tracker.Start(10_000);
         var firstProbe = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
@@ -78,6 +79,8 @@ sealed class PetApp
         trim.Tick += (_, _) => { trim.Stop(); Native.TrimWorkingSet(); };
         trim.Start();
 
+        StartAttentionWatch();
+
         sessionTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
         sessionTimer.Tick += (_, _) => CheckSessions();
         sessionTimer.Start();
@@ -88,6 +91,7 @@ sealed class PetApp
         if (quitting) return;
         quitting = true;
         try { tracker?.Stop(); } catch { /* ignore */ }
+        try { attnWatcher?.Dispose(); } catch { /* ignore */ }
         try
         {
             if (File.Exists(Paths.PidFile) && File.ReadAllText(Paths.PidFile).Trim() == Environment.ProcessId.ToString(CultureInfo.InvariantCulture))
@@ -155,6 +159,66 @@ sealed class PetApp
             win.SayText("交給 Claude 啦～", 3);
         }
         catch { win.SayText("開不了 Claude 桌面版...", 3); }
+    }
+
+    // ================= 每日預算提醒 =================
+    void CheckBudget(UsageStats st)
+    {
+        if (!Cfg.BudgetAlert || Cfg.DailyBudget <= 0 || st.Today < Cfg.DailyBudget) return;
+        string key = UsageTracker.LocalDate(DateTimeOffset.Now.ToUnixTimeMilliseconds()) + "@" + Cfg.DailyBudget.ToString(CultureInfo.InvariantCulture);
+        if (Cfg.BudgetAlertedKey == key) return;
+        Cfg.BudgetAlertedKey = key;
+        Cfg.Save();
+        win.OnBudget(st.Today, Cfg.DailyBudget);
+    }
+
+    // ================= 需要你批准時提醒 =================
+    // hook.js notify 在 attention\ 下放 <會話>.json，處理完（clear）就刪掉；這裡監看那個資料夾。
+    static readonly TimeSpan AttentionFresh = TimeSpan.FromMinutes(10);
+
+    void StartAttentionWatch()
+    {
+        try
+        {
+            Directory.CreateDirectory(Paths.Attention);
+            attnWatcher = new FileSystemWatcher(Paths.Attention, "*.json") { EnableRaisingEvents = true };
+            attnWatcher.Created += (_, _) => ui.BeginInvoke(CheckAttention);
+            attnWatcher.Changed += (_, _) => ui.BeginInvoke(CheckAttention);
+            attnWatcher.Deleted += (_, _) => ui.BeginInvoke(CheckAttention);
+            CheckAttention();
+        }
+        catch (Exception e) { Log.Error("attention", e); }
+    }
+
+    string? shownAttention;
+
+    void CheckAttention()
+    {
+        string? newest = null; long newestT = 0; string type = "", msg = "", cwd = "";
+        try
+        {
+            foreach (var f in Directory.GetFiles(Paths.Attention, "*.json"))
+            {
+                try
+                {
+                    if (DateTime.UtcNow - File.GetLastWriteTimeUtc(f) > AttentionFresh) { File.Delete(f); continue; }
+                    using var doc = JsonDocument.Parse(File.ReadAllText(f));
+                    var r = doc.RootElement;
+                    long t = r.TryGetProperty("t", out var tv) && tv.TryGetInt64(out var tl) ? tl : 0;
+                    if (newest != null && t < newestT) continue;
+                    newest = Path.GetFileName(f) + ":" + t; newestT = t;
+                    type = r.TryGetProperty("type", out var a) ? a.GetString() ?? "" : "";
+                    msg = r.TryGetProperty("message", out var b) ? b.GetString() ?? "" : "";
+                    cwd = r.TryGetProperty("cwd", out var c) ? c.GetString() ?? "" : "";
+                }
+                catch { /* 檔案正被寫，下一次事件會再來 */ }
+            }
+        }
+        catch { return; }
+        if (newest == null) { if (shownAttention != null) { shownAttention = null; win.ClearAttention(); } return; }
+        if (newest == shownAttention) return;
+        shownAttention = newest;
+        win.OnAttention(type, msg, cwd);
     }
 
     // ================= 跟著 Claude Code 開關 =================
@@ -311,7 +375,18 @@ sealed class PetApp
         }
         m.Add(size);
 
+        Add(m, "吸附螢幕邊緣（左右靠邊翻轉、上下不跑出畫面）", () => SetCfg(c => { c.SnapEdge = !c.SnapEdge; if (!c.SnapEdge) c.SnapSide = null; }), Cfg.SnapEdge);
         Add(m, "音效", () => SetCfg(c => c.Sound = !c.Sound), Cfg.Sound);
+        var budget = new Forms.ToolStripMenuItem("每日預算提醒");
+        Add(budget.DropDownItems, "啟用（今日花費超過預算時提醒）", () => SetCfg(c => c.BudgetAlert = !c.BudgetAlert), Cfg.BudgetAlert);
+        budget.DropDownItems.Add(new Forms.ToolStripSeparator());
+        foreach (var b in new[] { 1.0, 2, 5, 10, 20, 50, 100 })
+        {
+            double bv = b;
+            Add(budget.DropDownItems, $"預算 ${b:0}", () => SetCfg(c => c.DailyBudget = bv), Cfg.DailyBudget == b);
+        }
+        m.Add(budget);
+        Add(m, "需要我批准時提醒（氣泡加聲音）", () => SetCfg(c => c.AttentionBubble = !c.AttentionBubble), Cfg.AttentionBubble);
         Add(m, "每輪結束冒泡", () => SetCfg(c => c.TurnBubble = !c.TurnBubble), Cfg.TurnBubble);
         Add(m, "跟著 Claude Code 開關", () => SetCfg(c => c.FollowClaude = !c.FollowClaude), Cfg.FollowClaude);
         Add(m, "開機自啟", () => SetAutostart(!AutostartOn()), AutostartOn());

@@ -31,6 +31,10 @@ sealed class PetWindow : Window
     readonly StackPanel stage = new();
     readonly Image charImg = new();
     readonly ScaleTransform charScale = new(1, 1);
+    readonly ScaleTransform flip = new(1, 1); // 吸在左邊時水平翻轉
+    double opaqueL, opaqueR = 1, opaqueT; // 另含上緣
+    double _unusedOpaque; // 角色圖不透明部分的左右邊界（佔圖寬的比例）
+    double sideMargin; bool sideLeft;
     readonly Border badge = new();
     readonly StackPanel fiveBox = new();
     readonly StackPanel weekBox = new();
@@ -104,7 +108,10 @@ sealed class PetWindow : Window
         charImg.Stretch = Stretch.Uniform;
         RenderOptions.SetBitmapScalingMode(charImg, BitmapScalingMode.Fant);
         charImg.RenderTransformOrigin = new Point(0.5, 1);
-        charImg.RenderTransform = charScale;
+        var tg = new TransformGroup();
+        tg.Children.Add(charScale);
+        tg.Children.Add(flip);
+        charImg.RenderTransform = tg;
         charImg.Effect = Ui.Shadow(4, 3, 0.25);
         charImg.Cursor = Cursors.Hand;
         charImg.MouseLeftButtonDown += CharDown;
@@ -247,6 +254,9 @@ sealed class PetWindow : Window
         var wa = Forms.Screen.PrimaryScreen?.WorkingArea ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
         curH = H;
         wantH = -1;
+        Cfg.SnapSide = null;
+        Cfg.Mirrored = false; // 右下角本來就是面向左的預設樣子
+        ApplySnapLayout();
         int wP = (int)Math.Round(W * s), hP = (int)Math.Round(H * s);
         Native.SetWindowPos(hwnd, IntPtr.Zero, wa.X + wa.Width - wP - (int)Math.Round(20 * s), wa.Y + wa.Height - hP, wP, hP, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
         if (shown) ScheduleFit();
@@ -288,6 +298,119 @@ sealed class PetWindow : Window
     {
         ApplyScale();
         RenderBadge();
+        ApplySnapLayout();
+        if (Cfg.SnapEdge && drag == null && hwnd != IntPtr.Zero) SnapPosition();
+    }
+
+    // ================= 吸附邊緣 / 鏡像 =================
+    /// <summary>依吸附狀態翻轉角色，並讓氣泡往螢幕內側靠，不被螢幕邊緣切掉。</summary>
+    void ApplySnapLayout()
+    {
+        string? side = Cfg.SnapEdge ? Cfg.SnapSide : null;
+        flip.ScaleX = Cfg.SnapEdge && Cfg.Mirrored ? -1 : 1; // 翻轉會一直維持，直到下次吸到右邊
+        if (side == null)
+        {
+            sideMargin = 0;
+            bubbleBody.MaxWidth = 260;
+            bubbleBody.MinWidth = 90;
+            bubbleHost.HorizontalAlignment = HorizontalAlignment.Center;
+            bubbleTail.HorizontalAlignment = HorizontalAlignment.Center;
+            bubbleTail.Margin = new Thickness(0, 0, 0, -8);
+        }
+        else
+        {
+            double cw = double.IsNaN(charImg.Width) || charImg.Width <= 0 ? 170 : charImg.Width;
+            double x0 = Math.Max(0, (W - cw) / 2); // 視窗有 x0 寬度會被推出螢幕外
+            sideLeft = side == "left";
+            sideMargin = x0 + 6;
+            bubbleBody.MaxWidth = Math.Max(130, Math.Min(260, W - x0 - 12));
+            bubbleBody.MinWidth = 130;
+            bubbleHost.HorizontalAlignment = sideLeft ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+            double tailM = Math.Max(0, W / 2 - 9.5 - sideMargin); // 讓箭頭仍指著角色正上方
+            bubbleTail.HorizontalAlignment = sideLeft ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+            bubbleTail.Margin = sideLeft ? new Thickness(tailM, 0, 0, -8) : new Thickness(0, 0, tailM, -8);
+        }
+        PlaceBubble();
+    }
+
+    /// <summary>角色不透明部分的左右邊緣（實體像素），已考慮翻轉。</summary>
+    (double L, double R) CharSpan(int windowLeft, double s)
+    {
+        var b = BoundsOf(charImg);
+        bool fl = flip.ScaleX < 0;
+        double ol = fl ? 1 - opaqueR : opaqueL, or = fl ? 1 - opaqueL : opaqueR;
+        return (windowLeft + (b.Left + ol * b.Width) * s, windowLeft + (b.Left + or * b.Width) * s);
+    }
+
+    static bool HasScreenAt(Forms.Screen self, int x, int y) =>
+        Forms.Screen.AllScreens.Any(o => o.DeviceName != self.DeviceName && o.Bounds.Contains(x, y));
+
+    /// <summary>上下不超出螢幕（不改方向）：下緣靠近或掉出去就貼回工作列上方，上緣只在角色頂端超出時拉回。回傳要往下移的實體像素（負 = 往上）。</summary>
+    int VerticalShift(Native.RECT r, double s)
+    {
+        var scr = Forms.Screen.FromHandle(hwnd);
+        var wa = scr.WorkingArea;
+        int xMid = r.Left + r.Width / 2;
+        double zone = Cfg.SnapZone * s;
+        if (!HasScreenAt(scr, xMid, wa.Bottom + 1))
+        {
+            double db = wa.Bottom - r.Bottom; // 視窗底 = 角色腳底（含舞台 4 DIP 下緣）
+            if (db <= zone) return (int)Math.Round(db);
+        }
+        if (!HasScreenAt(scr, xMid, wa.Y - 2))
+        {
+            var b = BoundsOf(charImg);
+            double charTop = r.Top + (b.Top + opaqueT * b.Height) * s;
+            if (charTop < wa.Y) return (int)Math.Round(wa.Y - charTop);
+        }
+        return 0;
+    }
+
+    /// <summary>依視窗目前位置判斷該吸哪一邊。已經吸著時要離開更遠才放掉（遲滯），免得在邊界來回閃。</summary>
+    string? DetectSide(Native.RECT r, double s)
+    {
+        var scr = Forms.Screen.FromHandle(hwnd);
+        var wa = scr.WorkingArea;
+        // 雙螢幕：兩個螢幕交界的那一側不是真正的邊緣，不吸附（不然角色會被卡在交界線上、拉不到另一個螢幕）
+        int yMid = r.Bottom - (int)Math.Round(60 * s);
+        bool leftOpen = !HasScreenAt(scr, wa.X - 2, yMid), rightOpen = !HasScreenAt(scr, wa.Right + 1, yMid);
+        var (l, rr) = CharSpan(r.Left, s);
+        double zone = Cfg.SnapZone * s, dl = l - wa.X, dr = wa.Right - rr;
+        string? cur = Cfg.SnapSide;
+        double zl = cur == "left" ? zone * 1.5 : zone, zr = cur == "right" ? zone * 1.5 : zone;
+        bool nearL = leftOpen && dl <= zl, nearR = rightOpen && dr <= zr;
+        if (nearL && (!nearR || dl <= dr)) return "left";
+        if (nearR) return "right";
+        return null;
+    }
+
+    /// <summary>拖完放開：離左右邊緣夠近就貼齊並記下是哪一邊。</summary>
+    void SnapAfterDrag()
+    {
+        if (!Cfg.SnapEdge || !Native.GetWindowRect(hwnd, out var r)) return;
+        UpdateLayout();
+        Cfg.SnapSide = DetectSide(r, Scale);
+        if (Cfg.SnapSide == "left") Cfg.Mirrored = true;
+        else if (Cfg.SnapSide == "right") Cfg.Mirrored = false;
+        ApplySnapLayout();
+        SnapPosition();
+    }
+
+    /// <summary>把角色貼齊左／右外緣（若有吸附），並確保上下不超出螢幕。</summary>
+    void SnapPosition()
+    {
+        if (!Cfg.SnapEdge || !Native.GetWindowRect(hwnd, out var r)) return;
+        UpdateLayout();
+        double s = Scale;
+        int dx = 0;
+        if (Cfg.SnapSide != null)
+        {
+            var wa = Forms.Screen.FromHandle(hwnd).WorkingArea;
+            var (l, rr) = CharSpan(r.Left, s);
+            dx = (int)Math.Round(Cfg.SnapSide == "left" ? wa.X - l : wa.Right - rr);
+        }
+        int dy = VerticalShift(r, s);
+        if (dx != 0 || dy != 0) Native.SetWindowPos(hwnd, IntPtr.Zero, r.Left + dx, r.Top + dy, r.Width, r.Height, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
     }
 
     void ApplyScale()
@@ -310,7 +433,7 @@ sealed class PetWindow : Window
     {
         stage.Measure(new Size(W, double.PositiveInfinity));
         stageH = stage.DesiredSize.Height;
-        bubbleHost.Margin = new Thickness(0, 0, 0, stageH + 6);
+        bubbleHost.Margin = new Thickness(sideLeft ? sideMargin : 0, 0, sideLeft ? 0 : sideMargin, stageH + 6);
     }
 
     // ================= 氣泡 =================
@@ -471,6 +594,7 @@ sealed class PetWindow : Window
         if (charImg.IsMouseCaptured) charImg.ReleaseMouseCapture();
         if (d.Moved)
         {
+            SnapAfterDrag();
             if (Native.GetWindowRect(hwnd, out var r))
             {
                 double s = Scale;
@@ -496,6 +620,12 @@ sealed class PetWindow : Window
         for (int y = 0; y < maskH; y++)
             for (int x = 0; x < maskW; x++)
                 mask[y * maskW + x] = pix[((y * step) * w + x * step) * 4 + 3] > 30;
+        int minC = maskW, maxC = -1, minR = maskH;
+        for (int y = 0; y < maskH; y++)
+            for (int x = 0; x < maskW; x++)
+                if (mask[y * maskW + x]) { if (x < minC) minC = x; if (x > maxC) maxC = x; if (y < minR) minR = y; }
+        if (minR < maskH) opaqueT = (double)minR / maskH;
+        if (maxC >= minC) { opaqueL = (double)minC / maskW; opaqueR = (double)(maxC + 1) / maskW; }
     }
 
     Rect BoundsOf(FrameworkElement el) => el.TransformToVisual(root).TransformBounds(new Rect(0, 0, el.ActualWidth, el.ActualHeight));
@@ -507,6 +637,7 @@ sealed class PetWindow : Window
         if (mask == null) return true;
         int px = (int)Math.Floor((x - r.Left) / r.Width * maskW);
         int py = (int)Math.Floor((y - r.Top) / r.Height * maskH);
+        if (flip.ScaleX < 0) px = maskW - 1 - px;
         if (px < 0 || py < 0 || px >= maskW || py >= maskH) return false;
         return mask[py * maskW + px];
     }
@@ -738,6 +869,46 @@ sealed class PetWindow : Window
         panel.Children.Add(Ui.Text(TurnComment(t.Cost), 14, Ui.Brown));
         Say(panel, Cfg.TurnSeconds);
         Press(160);
+    }
+
+    /// <summary>Claude 在等你批准／回覆：發聲加一個不會自己消失的氣泡，點一下或處理完才收掉。</summary>
+    public void OnAttention(string type, string message, string cwd)
+    {
+        app.PlaySound("Ya1.mp3");
+        if (!Cfg.AttentionBubble) return;
+        string proj = string.IsNullOrEmpty(cwd) ? "" : cwd.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
+        string head = type switch
+        {
+            "permission_prompt" => "可以幫忙點個頭嗎？",
+            "idle_prompt" => "在等你回覆喔～",
+            "elicitation_dialog" => "有件事想問問你～",
+            _ => "這裡需要你看一下喔～",
+        };
+        var panel = new StackPanel { Tag = "attention" };
+        panel.Children.Add(Ui.Text((proj != "" ? proj + " · " : "") + "Claude 在等你", 11, Ui.Grey));
+        panel.Children.Add(Ui.Text(head, 18, Ui.Coral, bold: true));
+        if (!string.IsNullOrWhiteSpace(message))
+            panel.Children.Add(Ui.Text(message.Length > 80 ? message.Substring(0, 80) + "…" : message, 12, Ui.Brown));
+        Say(panel, 0);
+        Press(160);
+    }
+
+    /// <summary>今日花費超過每日預算（PetApp 已確認有啟用、有設金額、今天還沒提醒過）。</summary>
+    public void OnBudget(double today, double budget)
+    {
+        app.PlaySound("Ya2.mp3");
+        var panel = new StackPanel();
+        panel.Children.Add(Ui.Text("今天的預算到囉", 11, Ui.Grey));
+        panel.Children.Add(Ui.Text(Money(today) + " / " + Money(budget, 0), 20, Ui.Coral, bold: true));
+        panel.Children.Add(Ui.Text("只是輕輕提醒你一下喔～", 14, Ui.Brown));
+        Say(panel, 12);
+        Press(160);
+    }
+
+    /// <summary>待處理都處理完了：只收掉提醒氣泡，不動別的氣泡。</summary>
+    public void ClearAttention()
+    {
+        if (bubbleBody.Child is StackPanel sp && (sp.Tag as string) == "attention") HideBubble();
     }
 
     public void Bye() =>

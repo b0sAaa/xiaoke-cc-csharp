@@ -1,7 +1,7 @@
 // 把「跟著 Claude Code 一起開關」的 hook 寫進 ~/.claude/settings.json，或者移除。
 //   node scripts/hooks.js install
 //   node scripts/hooks.js uninstall
-// 只增刪本專案自己的三條 hook，其它設定原樣保留；寫入前先備份。
+// 只增刪本專案自己的 hook，其它設定原樣保留；寫入前先備份。
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -9,7 +9,7 @@ const path = require('path')
 const file = path.join(os.homedir(), '.claude', 'settings.json')
 const hookJs = path.resolve(__dirname, '..', 'hook.js').split(path.sep).join('/')
 const MARK = 'xiaoke-cc'
-const EVENTS = { SessionStart: ['start', true], UserPromptSubmit: ['ping', true], SessionEnd: ['end', false] }
+const EVENTS = { SessionStart: ['start', true], UserPromptSubmit: ['ping', true], SessionEnd: ['end', false], Notification: ['notify', true], PermissionRequest: ['notify', true], PostToolUse: ['clear', true], Stop: ['clear', true] }
 
 const mode = process.argv[2]
 let s = {}

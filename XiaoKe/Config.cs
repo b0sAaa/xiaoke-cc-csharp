@@ -12,6 +12,7 @@ static class Paths
     public static readonly string ConfigFile = Path.Combine(Data, "config.json");
     public static readonly string PidFile = Path.Combine(Data, "pid");
     public static readonly string Sessions = Path.Combine(Data, "sessions");
+    public static readonly string Attention = Path.Combine(Data, "attention");
     public static readonly string UsageCache = Path.Combine(Data, "usage-cache.json");
     public static readonly string ErrorLog = Path.Combine(Data, "xiaoke-cs-error.log");
     public static readonly string ClaudeProjects = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
@@ -42,6 +43,16 @@ sealed class Config
     public bool Sound { get; set; } = true;
     public double Volume { get; set; } = 0.5;
     public bool TurnBubble { get; set; } = true;
+    public bool AttentionBubble { get; set; } = true;
+    // 吸附螢幕左右邊緣：靠近就貼齊，貼左邊時角色水平翻轉（臉朝向螢幕內）
+    public bool SnapEdge { get; set; } = true;
+    public double SnapZone { get; set; } = 40; // 距離邊緣多少 DIP 內會吸附
+    public string? SnapSide { get; set; }      // "left" / "right" / null（目前沒貼著邊緣）
+    public bool Mirrored { get; set; }         // 角色是否翻轉：吸左邊變 true、吸右邊變 false，拉開不變
+    // 每日預算提醒：預設關閉；要「打勾」且金額大於 0 才會檢查
+    public bool BudgetAlert { get; set; }
+    public double DailyBudget { get; set; }
+    public string? BudgetAlertedKey { get; set; } // 「日期@預算」，同一天同一個預算只提醒一次
     public double TurnSeconds { get; set; } = 8;
     public bool FollowClaude { get; set; } = true;
     public bool UseReal { get; set; } = true;
