@@ -3,7 +3,8 @@
 //   node hook.js ping   —— UserPromptSubmit：重新整理會話的「線上」時間（順便兜底拉起小克）
 //   node hook.js end    —— SessionEnd：登出會話；最後一個會話結束後小克自己下班
 //   node hook.js notify —— Notification／PermissionRequest：Claude 等你批准／回覆時，留一份「待處理」讓小克提醒你
-//   node hook.js clear  —— PostToolUse / Stop：你處理完了，清掉「待處理」
+//   node hook.js clear  —— PostToolUse：你處理完了，清掉「待處理」
+//   node hook.js stop   —— Stop：這輪停下來了；最後一句是問句就當成在等你回覆，否則清掉「待處理」
 // 任何錯誤都靜默退出，絕不影響 Claude Code。
 const fs = require('fs')
 const path = require('path')
@@ -29,6 +30,31 @@ function alive() {
   }
 }
 
+// 這輪最後一則 Claude 的文字：優先用 hook 帶來的，沒有就從對話記錄尾端找
+function lastAssistantText(input) {
+  if (typeof input.last_assistant_message === 'string' && input.last_assistant_message) return input.last_assistant_message
+  try {
+    const fd = fs.openSync(input.transcript_path, 'r')
+    const size = fs.fstatSync(fd).size
+    const len = Math.min(size, 262144)
+    const buf = Buffer.alloc(len)
+    fs.readSync(fd, buf, 0, len, size - len)
+    fs.closeSync(fd)
+    const lines = buf.toString('utf8').split('\n').filter(Boolean)
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let o
+      try { o = JSON.parse(lines[i]) } catch (e) { continue }
+      if (o.type === 'user' && !Array.isArray(o.message?.content)) return '' // 已經回到使用者的訊息：這輪沒有文字
+      if (o.type !== 'assistant') continue
+      const text = (o.message?.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim()
+      if (text) return text
+    }
+  } catch (e) { /* 讀不到就當沒有 */ }
+  return ''
+}
+
+const isQuestion = text => /[？?][\s)）」』"'*_`~]*$/.test(String(text).trim())
+
 function launch() {
   // 啟動 C# 版（XiaoKe/）。路徑可用環境變數 XIAOKE_EXE 覆寫
   const cs = path.join(__dirname, 'XiaoKe')
@@ -53,6 +79,14 @@ try {
   const attn = path.join(attnDir, id + '.json')
   if (mode === 'clear') {
     fs.rmSync(attn, { force: true })
+  } else if (mode === 'stop') {
+    const text = lastAssistantText(input)
+    if (isQuestion(text)) {
+      fs.mkdirSync(attnDir, { recursive: true })
+      const lastLine = text.trim().split(/\n+/).pop().replace(/\s+/g, ' ').slice(0, 80)
+      fs.writeFileSync(attn, JSON.stringify({ type: 'idle_prompt', message: lastLine, cwd: input.cwd || '', t: Date.now() }))
+      if (!alive()) launch()
+    } else fs.rmSync(attn, { force: true })
   } else if (mode === 'notify') {
     fs.mkdirSync(attnDir, { recursive: true })
     // PermissionRequest 和 Notification 常常幾乎同時來：5 秒內已經有提醒就不重複響
@@ -60,9 +94,13 @@ try {
     try { fresh = Date.now() - fs.statSync(attn).mtimeMs < 5000 } catch (e) { /* 還沒有 */ }
     if (!fresh) {
       let type = input.notification_type || '', message = input.message || ''
-      if (input.hook_event_name === 'PermissionRequest') {
+      const ti = input.tool_input || {}
+      if (input.hook_event_name === 'PermissionRequest' && input.tool_name === 'AskUserQuestion') {
+        // 提問卡片：不是要你批准，是要你選答案
+        type = 'elicitation_dialog'
+        message = String((Array.isArray(ti.questions) && ti.questions[0]?.question) || '').replace(/\s+/g, ' ').slice(0, 80)
+      } else if (input.hook_event_name === 'PermissionRequest') {
         type = 'permission_prompt'
-        const ti = input.tool_input || {}
         const detail = String(ti.command || ti.file_path || ti.url || ti.pattern || '').replace(/\s+/g, ' ').slice(0, 80)
         message = (input.tool_name || '') + (detail ? '：' + detail : '')
       }

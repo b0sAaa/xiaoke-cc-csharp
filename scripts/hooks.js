@@ -9,7 +9,7 @@ const path = require('path')
 const file = path.join(os.homedir(), '.claude', 'settings.json')
 const hookJs = path.resolve(__dirname, '..', 'hook.js').split(path.sep).join('/')
 const MARK = 'xiaoke-cc'
-const EVENTS = { SessionStart: ['start', true], UserPromptSubmit: ['ping', true], SessionEnd: ['end', false], Notification: ['notify', true], PermissionRequest: ['notify', true], PostToolUse: ['clear', true], Stop: ['clear', true] }
+const EVENTS = { SessionStart: ['start', true], UserPromptSubmit: ['ping', true], SessionEnd: ['end', false], Notification: ['notify', true], PermissionRequest: ['notify', true], PostToolUse: ['clear', true], Stop: ['stop', true] }
 
 const mode = process.argv[2]
 let s = {}

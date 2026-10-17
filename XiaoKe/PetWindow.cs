@@ -862,6 +862,16 @@ sealed class PetWindow : Window
     {
         app.PlaySound("task-end-a.wav");
         if (!Cfg.TurnBubble) return;
+        // 正在提醒你回覆／批准：不蓋掉，把這輪花費附在提醒氣泡最下面
+        if (shown && bubbleBody.Child is StackPanel attn && (attn.Tag as string) == "attention")
+        {
+            foreach (var old in attn.Children.OfType<FrameworkElement>().Where(e => (e.Tag as string) == "turnCost").ToList()) attn.Children.Remove(old);
+            var cost = Ui.Text("這輪 " + Money(t.Cost), 11, Ui.Grey);
+            cost.Tag = "turnCost";
+            attn.Children.Add(cost);
+            Say(attn, 0);
+            return;
+        }
         string proj = string.IsNullOrEmpty(t.Cwd) ? "" : t.Cwd.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
         var panel = new StackPanel();
         panel.Children.Add(Ui.Text((proj != "" ? proj + " · " : "") + "這輪做完啦", 11, Ui.Grey));
